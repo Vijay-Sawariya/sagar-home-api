@@ -143,6 +143,12 @@ def ensure_user_permission_columns(cursor):
     except Exception:
         pass
 
+def ensure_action_assignment_column(cursor):
+    try:
+        cursor.execute("ALTER TABLE actions ADD COLUMN assigned_to INT NULL")
+    except Exception:
+        pass
+
 def ensure_security_audit_table(cursor):
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS security_audit_logs (
@@ -474,6 +480,7 @@ class ReminderCreate(BaseModel):
     reminder_date: str  # ISO format datetime string (YYYY-MM-DDTHH:MM:SS)
     reminder_type: str  # Maps to action_type
     notes: Optional[str] = None  # Maps to description
+    assigned_to: Optional[int] = None
     status: str = "Pending"
     priority: Optional[str] = "Medium"
 
@@ -1849,13 +1856,19 @@ def get_reminders(
     """Get all actions/reminders with lead information"""
     with get_db() as conn:
         cursor = conn.cursor()
+        ensure_action_assignment_column(cursor)
+        conn.commit()
         cursor.execute(
-            """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by
+            """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
+                      creator.full_name as created_by_name, creator.username as created_by_username,
+                      assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
                FROM actions a
                LEFT JOIN leads l ON a.lead_id = l.id
-               WHERE a.user_id = %s
+               LEFT JOIN users creator ON creator.id = a.user_id
+               LEFT JOIN users assignee ON assignee.id = a.assigned_to
+               WHERE a.user_id = %s OR a.assigned_to = %s
                ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
-            (current_user['id'], limit, skip)
+            (current_user['id'], current_user['id'], limit, skip)
         )
         actions = cursor.fetchall()
         
@@ -1894,6 +1907,7 @@ def create_reminder(reminder: ReminderCreate, current_user: dict = Depends(get_c
     """Create a new action/reminder in the actions table"""
     with get_db() as conn:
         cursor = conn.cursor()
+        ensure_action_assignment_column(cursor)
         
         # Parse the reminder_date to extract date and time parts (IST)
         # Format expected: YYYY-MM-DDTHH:MM:SS (already in IST from frontend)
@@ -1918,19 +1932,24 @@ def create_reminder(reminder: ReminderCreate, current_user: dict = Depends(get_c
             status = 'Completed'
         
         # Insert into actions table
+        assigned_to = reminder.assigned_to or current_user['id']
         cursor.execute(
-            """INSERT INTO actions (user_id, lead_id, title, description, action_type, due_date, due_time, status, priority, is_notified)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-            (current_user['id'], reminder.lead_id, reminder.title, reminder.notes,
+            """INSERT INTO actions (user_id, assigned_to, lead_id, title, description, action_type, due_date, due_time, status, priority, is_notified)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (current_user['id'], assigned_to, reminder.lead_id, reminder.title, reminder.notes,
              reminder.reminder_type, date_part, time_part, status, reminder.priority or 'Medium', 0)
         )
         conn.commit()
         action_id = cursor.lastrowid
         
         cursor.execute(
-            """SELECT a.*, l.name as lead_name, l.phone as lead_phone 
+            """SELECT a.*, l.name as lead_name, l.phone as lead_phone,
+                      creator.full_name as created_by_name, creator.username as created_by_username,
+                      assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
                FROM actions a
                LEFT JOIN leads l ON a.lead_id = l.id
+               LEFT JOIN users creator ON creator.id = a.user_id
+               LEFT JOIN users assignee ON assignee.id = a.assigned_to
                WHERE a.id = %s""", 
             (action_id,)
         )
@@ -1953,6 +1972,7 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
     """Update an action/reminder"""
     with get_db() as conn:
         cursor = conn.cursor()
+        ensure_action_assignment_column(cursor)
         
         # Handle reminder_date - split into due_date and due_time parts
         if 'reminder_date' in reminder_data:
@@ -1989,7 +2009,7 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
         update_fields = []
         values = []
         
-        allowed_fields = ['title', 'due_date', 'due_time', 'action_type', 'description', 'status', 'lead_id', 'priority', 'outcome', 'completed_at', 'is_notified']
+        allowed_fields = ['title', 'due_date', 'due_time', 'action_type', 'description', 'status', 'lead_id', 'assigned_to', 'priority', 'outcome', 'completed_at', 'is_notified']
         
         for field in allowed_fields:
             if field in reminder_data:
@@ -2001,7 +2021,8 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
         
         values.append(reminder_id)
         values.append(current_user['id'])
-        query = f"UPDATE actions SET {', '.join(update_fields)} WHERE id = %s AND user_id = %s"
+        values.append(current_user['id'])
+        query = f"UPDATE actions SET {', '.join(update_fields)} WHERE id = %s AND (user_id = %s OR assigned_to = %s)"
         
         cursor.execute(query, values)
         conn.commit()
@@ -2010,9 +2031,13 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
             raise HTTPException(status_code=404, detail="Action/Reminder not found")
         
         cursor.execute(
-            """SELECT a.*, l.name as lead_name, l.phone as lead_phone 
+            """SELECT a.*, l.name as lead_name, l.phone as lead_phone,
+                      creator.full_name as created_by_name, creator.username as created_by_username,
+                      assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
                FROM actions a
                LEFT JOIN leads l ON a.lead_id = l.id
+               LEFT JOIN users creator ON creator.id = a.user_id
+               LEFT JOIN users assignee ON assignee.id = a.assigned_to
                WHERE a.id = %s""", 
             (reminder_id,)
         )
@@ -3336,6 +3361,23 @@ def get_team_members(current_user: dict = Depends(get_current_user)):
         """)
         members = cursor.fetchall()
         return [dict(m) for m in members]
+
+@api_router.get("/users/assignable")
+def get_assignable_users(current_user: dict = Depends(get_current_user)):
+    """Get users available for reminder assignment."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, username, full_name, email, role
+            FROM users
+            ORDER BY COALESCE(NULLIF(full_name, ''), username)
+        """)
+        users = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            item['is_current_user'] = item.get('id') == current_user.get('id')
+            users.append(item)
+        return users
 
 @api_router.post("/team/assign-lead")
 def assign_lead_to_member(lead_id: int, user_id: int, current_user: dict = Depends(get_current_user)):
