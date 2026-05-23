@@ -2754,10 +2754,17 @@ def create_pricing(pricing: PlotPricingCreate, current_user: dict = Depends(get_
         
         # Insert plot pricing
         cursor.execute("""
-            INSERT INTO plot_pricing (location_id, circle, plot_size, price_per_sq_yard, min_price, max_price, tentative_price, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-        """, (pricing.location_id, pricing.circle, pricing.plot_size, pricing.price_per_sq_yard, 
-              pricing.min_price, pricing.max_price, pricing.tentative_price))
+            INSERT INTO plot_pricing (location_id, circle, plot_size, price_per_sq_yard, min_price, max_price, tentative_price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            pricing.location_id,
+            pricing.circle,
+            pricing.plot_size,
+            pricing.price_per_sq_yard,
+            pricing.min_price,
+            pricing.max_price,
+            pricing.tentative_price
+        ))
         conn.commit()
         
         plot_pricing_id = cursor.lastrowid
@@ -2766,8 +2773,8 @@ def create_pricing(pricing: PlotPricingCreate, current_user: dict = Depends(get_
         for floor in pricing.floors:
             if floor.get('floor_label') and floor.get('tentative_floor_price'):
                 cursor.execute("""
-                    INSERT INTO plot_floor_pricing (plot_pricing_id, floor_label, tentative_floor_price, created_at, updated_at)
-                    VALUES (%s, %s, %s, NOW(), NOW())
+                    INSERT INTO plot_floor_pricing (plot_pricing_id, floor_label, tentative_floor_price)
+                    VALUES (%s, %s, %s)
                 """, (plot_pricing_id, floor['floor_label'], floor['tentative_floor_price']))
         
         conn.commit()
@@ -2791,7 +2798,6 @@ def update_pricing(pricing_id: int, pricing_data: dict, current_user: dict = Dep
                 values.append(pricing_data[field])
         
         if update_fields:
-            update_fields.append("updated_at = NOW()")
             values.append(pricing_id)
             query = f"UPDATE plot_pricing SET {', '.join(update_fields)} WHERE id = %s"
             cursor.execute(query, values)
@@ -2805,8 +2811,8 @@ def update_pricing(pricing_id: int, pricing_data: dict, current_user: dict = Dep
             for floor in pricing_data['floors']:
                 if floor.get('floor_label') and floor.get('tentative_floor_price'):
                     cursor.execute("""
-                        INSERT INTO plot_floor_pricing (plot_pricing_id, floor_label, tentative_floor_price, created_at, updated_at)
-                        VALUES (%s, %s, %s, NOW(), NOW())
+                        INSERT INTO plot_floor_pricing (plot_pricing_id, floor_label, tentative_floor_price)
+                        VALUES (%s, %s, %s)
                     """, (pricing_id, floor['floor_label'], floor['tentative_floor_price']))
         
         conn.commit()
