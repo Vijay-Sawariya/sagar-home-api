@@ -2386,20 +2386,24 @@ def get_reminders(
     """Get all actions/reminders with lead information"""
     with get_db() as conn:
         cursor = conn.cursor()
-        ensure_action_assignment_column(cursor)
-        conn.commit()
-        cursor.execute(
-            """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
-                      creator.full_name as created_by_name, creator.username as created_by_username,
-                      assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
-               FROM actions a
-               LEFT JOIN leads l ON a.lead_id = l.id
-               LEFT JOIN users creator ON creator.id = a.user_id
-               LEFT JOIN users assignee ON assignee.id = a.assigned_to
-               WHERE a.user_id = %s OR a.assigned_to = %s
-               ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
-            (current_user['id'], current_user['id'], limit, skip)
-        )
+        is_admin = (current_user.get('role') or '').lower() == 'admin'
+        if is_admin:
+            cursor.execute(
+                """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by
+                   FROM actions a
+                   LEFT JOIN leads l ON a.lead_id = l.id
+                   ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
+                (limit, skip)
+            )
+        else:
+            cursor.execute(
+                """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by
+                   FROM actions a
+                   LEFT JOIN leads l ON a.lead_id = l.id
+                   WHERE a.user_id = %s
+                   ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
+                (current_user['id'], limit, skip)
+            )
         actions = cursor.fetchall()
         assignment_map = current_assignee_map(
             cursor,
@@ -3567,7 +3571,7 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
             ensure_site_visits_table(cursor)
             conn.commit()
             
-
+            is_admin = (current_user.get('role') or '').lower() == 'admin'
             query = """
                 SELECT sv.*, 
                        l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
@@ -3577,10 +3581,14 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
                 FROM site_visits sv
                 LEFT JOIN leads l ON sv.lead_id = l.id
                 LEFT JOIN leads p ON sv.property_lead_id = p.id
-                 WHERE sv.created_by = %s
+                WHERE 1=1
             """
-            params = [current_user['id']]
+            params = []
 
+            if not is_admin:
+                query += " AND sv.created_by = %s"
+                params.append(current_user['id'])
+            
             if status:
                 query += " AND sv.status = %s"
                 params.append(status)
