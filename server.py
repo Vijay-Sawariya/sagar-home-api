@@ -4492,7 +4492,8 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
             LEFT JOIN users u ON u.id = a.assigned_to
             WHERE a.status IN ('Pending', 'Up Coming', 'Missed')
               AND (a.user_id = %s OR a.assigned_to = %s OR %s = 'admin')
-              AND (l.id IS NULL OR l.is_deleted IS NULL OR l.is_deleted = 0)
+              AND LOWER(IFNULL(l.lead_type, '')) IN ('buyer', 'tenant')
+              AND (l.is_deleted IS NULL OR l.is_deleted = 0)
         """
 
         cursor.execute(f"""
@@ -4569,7 +4570,7 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
                    ) as pending_action_count
             FROM leads l
             LEFT JOIN users u ON u.id = l.created_by
-            WHERE LOWER(IFNULL(l.lead_type, '')) IN ('buyer', 'tenant', 'seller', 'landlord', 'builder', 'agent')
+            WHERE LOWER(IFNULL(l.lead_type, '')) IN ('buyer', 'tenant')
               AND (l.is_deleted IS NULL OR l.is_deleted = 0)
               AND (l.lead_status IS NULL OR l.lead_status NOT IN ('Won', 'Closed/Lost', 'Lost', 'Sold', 'Already Rented'))
               AND (l.last_message_sent_on IS NULL OR DATE(l.last_message_sent_on) <= DATE_SUB(CURDATE(), INTERVAL 3 DAY))
@@ -4586,22 +4587,6 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
             item.update(_build_whatsapp_intelligence(row))
             whatsapp_due.append(item)
 
-        fresh_enquiries = []
-        enquiry_meta = _find_enquiry_table(cursor)
-        if enquiry_meta:
-            table = enquiry_meta["table"]
-            where = _enquiry_where_clause(enquiry_meta)
-            created_expr = enquiry_meta.get("created_at") or enquiry_meta["id"]
-            select_parts = _enquiry_select_parts(enquiry_meta)
-            cursor.execute(f"""
-                SELECT {', '.join(select_parts)}
-                FROM {table}
-                WHERE {where}
-                ORDER BY {created_expr} DESC
-                LIMIT 10
-            """)
-            fresh_enquiries = [dict(row) for row in cursor.fetchall()]
-
     smart_match_inbox = get_smart_matches(current_user=current_user, limit=12)
 
     return {
@@ -4612,7 +4597,6 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
         "whatsapp_due_leads": whatsapp_due,
         "hot_leads_without_action": hot_leads,
         "notes_missing": notes_missing,
-        "fresh_enquiries": fresh_enquiries,
         "smart_matches": smart_match_inbox,
         "summary": {
             "priority_actions": len(actions),
@@ -4621,7 +4605,6 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
             "whatsapp_due_leads": len(whatsapp_due),
             "hot_leads_without_action": len(hot_leads),
             "notes_missing": len(notes_missing),
-            "fresh_enquiries": len(fresh_enquiries),
             "smart_matches": len(smart_match_inbox),
         }
     }
