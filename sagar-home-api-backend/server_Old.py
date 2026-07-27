@@ -1468,7 +1468,7 @@ def get_inventory_leads(
             """SELECT l.*, u.full_name as created_by_name 
                FROM leads l
                LEFT JOIN users u ON l.created_by = u.id
-               WHERE l.lead_type IN ('seller', 'landlord', 'builder', 'agent') 
+               WHERE l.lead_type IN ('seller', 'landlord', 'builder', 'agent')
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
                ORDER BY l.created_at DESC LIMIT %s OFFSET %s""",
             (limit, skip)
@@ -2830,7 +2830,7 @@ def get_smart_matches(current_user: dict = Depends(get_current_user), limit: int
                    building_facing, property_type, area_size, lead_type,
                    lead_status, created_by, updated_on
             FROM leads 
-            WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent') 
+            WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent')
             AND lead_status NOT IN ('Sold', 'Closed/Lost', 'Lost')
             AND (is_deleted IS NULL OR is_deleted = 0)
             ORDER BY updated_on DESC
@@ -3567,7 +3567,7 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
             ensure_site_visits_table(cursor)
             conn.commit()
             
-           
+
             query = """
                 SELECT sv.*, 
                        l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
@@ -3582,7 +3582,7 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
             params = [current_user['id']]
 
             if status:
-                query += " AND sv.status = %s" 
+                query += " AND sv.status = %s"
                 params.append(status)
             
             query += " ORDER BY sv.visit_date ASC, sv.visit_time ASC, COALESCE(sv.visit_order, 999) ASC"
@@ -3958,7 +3958,7 @@ def get_lead_activity(lead_id: int, current_user: dict = Depends(get_current_use
         
         # Get follow-ups/actions
         cursor.execute("""
-            SELECT 'action' as type, id, title, description, action_type, due_date as activity_date, 
+            SELECT 'action' as type, id, title, description, action_type, due_date as activity_date,
                    status, created_at, NULL as created_by_name
             FROM actions WHERE lead_id = %s
             ORDER BY created_at DESC
@@ -4377,68 +4377,6 @@ def _legacy_search_clause(search: Optional[str], source: str) -> tuple[str, List
         params.append(f"%{phone_key}%")
     return f" AND ({' OR '.join(clauses)})", params
 
-def _legacy_search_criteria_clause(
-    source: str,
-    name: Optional[str] = None,
-    location: Optional[str] = None,
-    address: Optional[str] = None,
-    phone: Optional[str] = None,
-    status: Optional[str] = None,
-    message_status: Optional[str] = None,
-) -> tuple[str, List[str]]:
-    clauses: List[str] = []
-    params: List[str] = []
-
-    field_columns = {
-        "kothi": {
-            "name": "k.owner_name",
-            "location": "k.location",
-            "address": "k.address",
-        },
-        "floor": {
-            "name": "e.name",
-            "location": "e.location",
-            "address": "e.address",
-        },
-    }[source]
-
-    for value, column in (
-        (name, field_columns["name"]),
-        (location, field_columns["location"]),
-        (address, field_columns["address"]),
-    ):
-        query = (value or "").strip()
-        if query:
-            clauses.append(f"{column} LIKE %s")
-            params.append(f"%{query}%")
-
-    phone_digits = re.sub(r"[^0-9]", "", phone or "")
-    if phone_digits:
-        phone_key = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
-        if source == "kothi":
-            phone_expression = "REGEXP_REPLACE(COALESCE(NULLIF(k.contact, ''), CONCAT_WS('', k.contact_1, k.contact_2), ''), '[^0-9]', '')"
-        else:
-            phone_expression = "REGEXP_REPLACE(COALESCE(e.phone, ''), '[^0-9]', '')"
-        clauses.append(f"{phone_expression} LIKE %s")
-        params.append(f"%{phone_key}%")
-
-    status_query = (status or "").strip()
-    if status_query:
-        status_column = "k.status" if source == "kothi" else "e.status"
-        clauses.append(f"{status_column} LIKE %s")
-        params.append(f"%{status_query}%")
-
-    if message_status == "not_sent":
-        sent_column = "k.last_message_sent_on" if source == "kothi" else "e.last_message_sent_on"
-        clauses.append(f"{sent_column} IS NULL")
-    elif message_status == "sent":
-        sent_column = "k.last_message_sent_on" if source == "kothi" else "e.last_message_sent_on"
-        clauses.append(f"{sent_column} IS NOT NULL")
-
-    if not clauses:
-        return "", []
-    return f" AND {' AND '.join(clauses)}", params
-
 def _legacy_floor_select() -> str:
     return """
         SELECT
@@ -4721,18 +4659,7 @@ def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), li
         return [_lead_summary(row, user_role, user_id) for row in rows]
 
 @api_router.get("/mobile/enquiries")
-def get_mobile_enquiries(
-    current_user: dict = Depends(get_current_user),
-    limit: int = 100,
-    category: Optional[str] = None,
-    search: Optional[str] = None,
-    name: Optional[str] = None,
-    location: Optional[str] = None,
-    address: Optional[str] = None,
-    phone: Optional[str] = None,
-    status: Optional[str] = None,
-    message_status: Optional[str] = None,
-):
+def get_mobile_enquiries(current_user: dict = Depends(get_current_user), limit: int = 100, category: Optional[str] = None, search: Optional[str] = None):
     """Legacy inventory records using the same sources as kothis.php and legacy_leads.php."""
     safe_limit = max(1, min(limit, 300))
     safe_category = category if category in ("kothi", "floor") else "all"
@@ -4747,16 +4674,6 @@ def get_mobile_enquiries(
         floor_where = _legacy_floor_where()
         kothi_search_clause, kothi_search_params = _legacy_search_clause(search, "kothi")
         floor_search_clause, floor_search_params = _legacy_search_clause(search, "floor")
-        kothi_criteria_clause, kothi_criteria_params = _legacy_search_criteria_clause(
-            "kothi", name, location, address, phone, status, message_status
-        )
-        floor_criteria_clause, floor_criteria_params = _legacy_search_criteria_clause(
-            "floor", name, location, address, phone, status, message_status
-        )
-        kothi_search_clause += kothi_criteria_clause
-        floor_search_clause += floor_criteria_clause
-        kothi_search_params += kothi_criteria_params
-        floor_search_params += floor_criteria_params
 
         cursor.execute("SELECT COUNT(*) as count FROM kothis_details")
         kothi_historical = cursor.fetchone()["count"]
@@ -4801,14 +4718,6 @@ def get_mobile_enquiries(
             "table": "kothis_details,enquiries",
             "category": safe_category,
             "search": search or "",
-            "criteria": {
-                "name": name or "",
-                "location": location or "",
-                "address": address or "",
-                "phone": phone or "",
-                "status": status or "",
-                "message_status": message_status or "all",
-            },
             "total": kothi_count + floor_count,
             "historical_total": kothi_historical + floor_historical,
             "counts": {
@@ -5339,7 +5248,7 @@ def get_team_members(current_user: dict = Depends(get_current_user)):
     """Get all team members (admin only)"""
     if current_user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
