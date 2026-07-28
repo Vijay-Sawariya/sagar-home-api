@@ -217,9 +217,9 @@ APP_FEATURE_FLAGS = {
     "team_management": "Team",
 }
 
-def ensure_user_feature_flags_table(cursor):
+def ensure_user_mobile_feature_flags_table(cursor):
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_feature_flags (
+        CREATE TABLE IF NOT EXISTS user_mobile_feature_flags (
             user_id INT NOT NULL,
             feature_key VARCHAR(80) NOT NULL,
             is_enabled TINYINT(1) NOT NULL DEFAULT 1,
@@ -227,16 +227,31 @@ def ensure_user_feature_flags_table(cursor):
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (user_id, feature_key),
-            KEY idx_user_feature_flags_feature (feature_key),
-            KEY idx_user_feature_flags_enabled (user_id, is_enabled)
+            KEY idx_user_mobile_feature_flags_feature (feature_key),
+            KEY idx_user_mobile_feature_flags_enabled (user_id, is_enabled)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """)
+    # Preserve existing app choices the first time the separate mobile scope is used.
+    try:
+        cursor.execute(
+            """
+            INSERT IGNORE INTO user_mobile_feature_flags
+                (user_id, feature_key, is_enabled, updated_by, created_at, updated_at)
+            SELECT user_id, feature_key, is_enabled, updated_by, created_at, updated_at
+            FROM user_feature_flags
+            WHERE feature_key IN ({})
+               OR feature_key = '__default__'
+            """.format(",".join(["%s"] * len(APP_FEATURE_FLAGS))),
+            tuple(APP_FEATURE_FLAGS.keys()),
+        )
+    except Exception as exc:
+        logging.warning(f"Existing feature flag migration to mobile scope skipped: {exc}")
 
-def get_user_feature_flag_values(cursor, user_id: int) -> Dict[str, bool]:
+def get_user_mobile_feature_flag_values(cursor, user_id: int) -> Dict[str, bool]:
     cursor.execute(
         """
         SELECT feature_key, is_enabled
-        FROM user_feature_flags
+        FROM user_mobile_feature_flags
         WHERE user_id = %s
           AND (feature_key IN ({}) OR feature_key = '__default__')
         """.format(",".join(["%s"] * len(APP_FEATURE_FLAGS))),
@@ -5495,21 +5510,15 @@ def get_user_permissions(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/user/feature-flags")
 def get_current_user_feature_flags(current_user: dict = Depends(get_current_user)):
-    """Return the current user's app screen and feature access."""
+    """Return the current user's independently managed mobile app access."""
     is_admin = str(current_user.get("role") or "").strip().lower() == "admin"
-    if is_admin:
-        return {
-            "is_admin": True,
-            "flags": {key: True for key in APP_FEATURE_FLAGS},
-        }
-
     with get_db() as conn:
         cursor = conn.cursor()
-        ensure_user_feature_flags_table(cursor)
+        ensure_user_mobile_feature_flags_table(cursor)
         conn.commit()
         return {
-            "is_admin": False,
-            "flags": get_user_feature_flag_values(cursor, int(current_user["id"])),
+            "is_admin": is_admin,
+            "flags": get_user_mobile_feature_flag_values(cursor, int(current_user["id"])),
         }
 
 @api_router.put("/user/{user_id}/permissions")

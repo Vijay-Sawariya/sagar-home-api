@@ -199,6 +199,56 @@ def ensure_user_permission_columns(cursor):
     except Exception:
         pass
 
+APP_FEATURE_FLAGS = {
+    "buyer_leads": "Clients",
+    "seller_inventory": "Inventory",
+    "builders_agents": "Builders",
+    "followups": "Reminders",
+    "daily_workbench": "Workbench",
+    "legacy_inventory": "Legacy Inventory",
+    "assigned_leads": "Assigned Leads",
+    "team_inbox": "Team Inbox",
+    "agent_performance": "Performance",
+    "site_visits": "Site Visits",
+    "activity_feed": "Activity",
+    "lead_map": "Lead Map",
+    "inventory_pricing": "Pricing",
+    "data_export": "Export",
+    "team_management": "Team",
+}
+
+def ensure_user_feature_flags_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_feature_flags (
+            user_id INT NOT NULL,
+            feature_key VARCHAR(80) NOT NULL,
+            is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+            updated_by INT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, feature_key),
+            KEY idx_user_feature_flags_feature (feature_key),
+            KEY idx_user_feature_flags_enabled (user_id, is_enabled)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
+def get_user_feature_flag_values(cursor, user_id: int) -> Dict[str, bool]:
+    cursor.execute(
+        """
+        SELECT feature_key, is_enabled
+        FROM user_feature_flags
+        WHERE user_id = %s
+          AND (feature_key IN ({}) OR feature_key = '__default__')
+        """.format(",".join(["%s"] * len(APP_FEATURE_FLAGS))),
+        tuple([user_id] + list(APP_FEATURE_FLAGS.keys())),
+    )
+    stored = {row["feature_key"]: bool(row["is_enabled"]) for row in cursor.fetchall()}
+    default_enabled = stored.get("__default__", True)
+    return {
+        key: stored.get(key, default_enabled)
+        for key in APP_FEATURE_FLAGS
+    }
+
 def ensure_action_assignment_column(cursor):
     try:
         cursor.execute("ALTER TABLE actions ADD COLUMN assigned_to INT NULL")
@@ -1468,7 +1518,7 @@ def get_inventory_leads(
             """SELECT l.*, u.full_name as created_by_name 
                FROM leads l
                LEFT JOIN users u ON l.created_by = u.id
-               WHERE l.lead_type IN ('seller', 'landlord', 'builder', 'agent')
+               WHERE l.lead_type IN ('seller', 'landlord', 'builder', 'agent') 
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
                ORDER BY l.created_at DESC LIMIT %s OFFSET %s""",
             (limit, skip)
@@ -2386,24 +2436,20 @@ def get_reminders(
     """Get all actions/reminders with lead information"""
     with get_db() as conn:
         cursor = conn.cursor()
-        is_admin = (current_user.get('role') or '').lower() == 'admin'
-        if is_admin:
-            cursor.execute(
-                """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by
-                   FROM actions a
-                   LEFT JOIN leads l ON a.lead_id = l.id
-                   ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
-                (limit, skip)
-            )
-        else:
-            cursor.execute(
-                """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by
-                   FROM actions a
-                   LEFT JOIN leads l ON a.lead_id = l.id
-                   WHERE a.user_id = %s
-                   ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
-                (current_user['id'], limit, skip)
-            )
+        ensure_action_assignment_column(cursor)
+        conn.commit()
+        cursor.execute(
+            """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
+                      creator.full_name as created_by_name, creator.username as created_by_username,
+                      assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
+               FROM actions a
+               LEFT JOIN leads l ON a.lead_id = l.id
+               LEFT JOIN users creator ON creator.id = a.user_id
+               LEFT JOIN users assignee ON assignee.id = a.assigned_to
+               WHERE a.user_id = %s OR a.assigned_to = %s
+               ORDER BY a.due_date ASC, a.due_time ASC LIMIT %s OFFSET %s""",
+            (current_user['id'], current_user['id'], limit, skip)
+        )
         actions = cursor.fetchall()
         assignment_map = current_assignee_map(
             cursor,
@@ -2834,7 +2880,7 @@ def get_smart_matches(current_user: dict = Depends(get_current_user), limit: int
                    building_facing, property_type, area_size, lead_type,
                    lead_status, created_by, updated_on
             FROM leads 
-            WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent')
+            WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent') 
             AND lead_status NOT IN ('Sold', 'Closed/Lost', 'Lost')
             AND (is_deleted IS NULL OR is_deleted = 0)
             ORDER BY updated_on DESC
@@ -3571,7 +3617,7 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
             ensure_site_visits_table(cursor)
             conn.commit()
             
-            is_admin = (current_user.get('role') or '').lower() == 'admin'
+           
             query = """
                 SELECT sv.*, 
                        l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
@@ -3581,16 +3627,12 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
                 FROM site_visits sv
                 LEFT JOIN leads l ON sv.lead_id = l.id
                 LEFT JOIN leads p ON sv.property_lead_id = p.id
-                WHERE 1=1
+                 WHERE sv.created_by = %s
             """
-            params = []
+            params = [current_user['id']]
 
-            if not is_admin:
-                query += " AND sv.created_by = %s"
-                params.append(current_user['id'])
-            
             if status:
-                query += " AND sv.status = %s"
+                query += " AND sv.status = %s" 
                 params.append(status)
             
             query += " ORDER BY sv.visit_date ASC, sv.visit_time ASC, COALESCE(sv.visit_order, 999) ASC"
@@ -3966,7 +4008,7 @@ def get_lead_activity(lead_id: int, current_user: dict = Depends(get_current_use
         
         # Get follow-ups/actions
         cursor.execute("""
-            SELECT 'action' as type, id, title, description, action_type, due_date as activity_date,
+            SELECT 'action' as type, id, title, description, action_type, due_date as activity_date, 
                    status, created_at, NULL as created_by_name
             FROM actions WHERE lead_id = %s
             ORDER BY created_at DESC
@@ -4385,6 +4427,68 @@ def _legacy_search_clause(search: Optional[str], source: str) -> tuple[str, List
         params.append(f"%{phone_key}%")
     return f" AND ({' OR '.join(clauses)})", params
 
+def _legacy_search_criteria_clause(
+    source: str,
+    name: Optional[str] = None,
+    location: Optional[str] = None,
+    address: Optional[str] = None,
+    phone: Optional[str] = None,
+    status: Optional[str] = None,
+    message_status: Optional[str] = None,
+) -> tuple[str, List[str]]:
+    clauses: List[str] = []
+    params: List[str] = []
+
+    field_columns = {
+        "kothi": {
+            "name": "k.owner_name",
+            "location": "k.location",
+            "address": "k.address",
+        },
+        "floor": {
+            "name": "e.name",
+            "location": "e.location",
+            "address": "e.address",
+        },
+    }[source]
+
+    for value, column in (
+        (name, field_columns["name"]),
+        (location, field_columns["location"]),
+        (address, field_columns["address"]),
+    ):
+        query = (value or "").strip()
+        if query:
+            clauses.append(f"{column} LIKE %s")
+            params.append(f"%{query}%")
+
+    phone_digits = re.sub(r"[^0-9]", "", phone or "")
+    if phone_digits:
+        phone_key = phone_digits[-10:] if len(phone_digits) >= 10 else phone_digits
+        if source == "kothi":
+            phone_expression = "REGEXP_REPLACE(COALESCE(NULLIF(k.contact, ''), CONCAT_WS('', k.contact_1, k.contact_2), ''), '[^0-9]', '')"
+        else:
+            phone_expression = "REGEXP_REPLACE(COALESCE(e.phone, ''), '[^0-9]', '')"
+        clauses.append(f"{phone_expression} LIKE %s")
+        params.append(f"%{phone_key}%")
+
+    status_query = (status or "").strip()
+    if status_query:
+        status_column = "k.status" if source == "kothi" else "e.status"
+        clauses.append(f"{status_column} LIKE %s")
+        params.append(f"%{status_query}%")
+
+    if message_status == "not_sent":
+        sent_column = "k.last_message_sent_on" if source == "kothi" else "e.last_message_sent_on"
+        clauses.append(f"{sent_column} IS NULL")
+    elif message_status == "sent":
+        sent_column = "k.last_message_sent_on" if source == "kothi" else "e.last_message_sent_on"
+        clauses.append(f"{sent_column} IS NOT NULL")
+
+    if not clauses:
+        return "", []
+    return f" AND {' AND '.join(clauses)}", params
+
 def _legacy_floor_select() -> str:
     return """
         SELECT
@@ -4667,7 +4771,18 @@ def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), li
         return [_lead_summary(row, user_role, user_id) for row in rows]
 
 @api_router.get("/mobile/enquiries")
-def get_mobile_enquiries(current_user: dict = Depends(get_current_user), limit: int = 100, category: Optional[str] = None, search: Optional[str] = None):
+def get_mobile_enquiries(
+    current_user: dict = Depends(get_current_user),
+    limit: int = 100,
+    category: Optional[str] = None,
+    search: Optional[str] = None,
+    name: Optional[str] = None,
+    location: Optional[str] = None,
+    address: Optional[str] = None,
+    phone: Optional[str] = None,
+    status: Optional[str] = None,
+    message_status: Optional[str] = None,
+):
     """Legacy inventory records using the same sources as kothis.php and legacy_leads.php."""
     safe_limit = max(1, min(limit, 300))
     safe_category = category if category in ("kothi", "floor") else "all"
@@ -4682,6 +4797,16 @@ def get_mobile_enquiries(current_user: dict = Depends(get_current_user), limit: 
         floor_where = _legacy_floor_where()
         kothi_search_clause, kothi_search_params = _legacy_search_clause(search, "kothi")
         floor_search_clause, floor_search_params = _legacy_search_clause(search, "floor")
+        kothi_criteria_clause, kothi_criteria_params = _legacy_search_criteria_clause(
+            "kothi", name, location, address, phone, status, message_status
+        )
+        floor_criteria_clause, floor_criteria_params = _legacy_search_criteria_clause(
+            "floor", name, location, address, phone, status, message_status
+        )
+        kothi_search_clause += kothi_criteria_clause
+        floor_search_clause += floor_criteria_clause
+        kothi_search_params += kothi_criteria_params
+        floor_search_params += floor_criteria_params
 
         cursor.execute("SELECT COUNT(*) as count FROM kothis_details")
         kothi_historical = cursor.fetchone()["count"]
@@ -4726,6 +4851,14 @@ def get_mobile_enquiries(current_user: dict = Depends(get_current_user), limit: 
             "table": "kothis_details,enquiries",
             "category": safe_category,
             "search": search or "",
+            "criteria": {
+                "name": name or "",
+                "location": location or "",
+                "address": address or "",
+                "phone": phone or "",
+                "status": status or "",
+                "message_status": message_status or "all",
+            },
             "total": kothi_count + floor_count,
             "historical_total": kothi_historical + floor_historical,
             "counts": {
@@ -5256,7 +5389,7 @@ def get_team_members(current_user: dict = Depends(get_current_user)):
     """Get all team members (admin only)"""
     if current_user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
-
+    
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -5359,6 +5492,25 @@ def get_user_permissions(current_user: dict = Depends(get_current_user)):
         can_export = result['can_export'] if result and 'can_export' in result else False
         
         return {"can_export": bool(can_export), "is_admin": False}
+
+@api_router.get("/user/feature-flags")
+def get_current_user_feature_flags(current_user: dict = Depends(get_current_user)):
+    """Return the current user's app screen and feature access."""
+    is_admin = str(current_user.get("role") or "").strip().lower() == "admin"
+    if is_admin:
+        return {
+            "is_admin": True,
+            "flags": {key: True for key in APP_FEATURE_FLAGS},
+        }
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_user_feature_flags_table(cursor)
+        conn.commit()
+        return {
+            "is_admin": False,
+            "flags": get_user_feature_flag_values(cursor, int(current_user["id"])),
+        }
 
 @api_router.put("/user/{user_id}/permissions")
 def update_user_permissions(user_id: int, can_export: bool, current_user: dict = Depends(get_current_user)):
