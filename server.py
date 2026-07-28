@@ -199,6 +199,56 @@ def ensure_user_permission_columns(cursor):
     except Exception:
         pass
 
+APP_FEATURE_FLAGS = {
+    "buyer_leads": "Clients",
+    "seller_inventory": "Inventory",
+    "builders_agents": "Builders",
+    "followups": "Reminders",
+    "daily_workbench": "Workbench",
+    "legacy_inventory": "Legacy Inventory",
+    "assigned_leads": "Assigned Leads",
+    "team_inbox": "Team Inbox",
+    "agent_performance": "Performance",
+    "site_visits": "Site Visits",
+    "activity_feed": "Activity",
+    "lead_map": "Lead Map",
+    "inventory_pricing": "Pricing",
+    "data_export": "Export",
+    "team_management": "Team",
+}
+
+def ensure_user_feature_flags_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_feature_flags (
+            user_id INT NOT NULL,
+            feature_key VARCHAR(80) NOT NULL,
+            is_enabled TINYINT(1) NOT NULL DEFAULT 1,
+            updated_by INT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, feature_key),
+            KEY idx_user_feature_flags_feature (feature_key),
+            KEY idx_user_feature_flags_enabled (user_id, is_enabled)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
+def get_user_feature_flag_values(cursor, user_id: int) -> Dict[str, bool]:
+    cursor.execute(
+        """
+        SELECT feature_key, is_enabled
+        FROM user_feature_flags
+        WHERE user_id = %s
+          AND (feature_key IN ({}) OR feature_key = '__default__')
+        """.format(",".join(["%s"] * len(APP_FEATURE_FLAGS))),
+        tuple([user_id] + list(APP_FEATURE_FLAGS.keys())),
+    )
+    stored = {row["feature_key"]: bool(row["is_enabled"]) for row in cursor.fetchall()}
+    default_enabled = stored.get("__default__", True)
+    return {
+        key: stored.get(key, default_enabled)
+        for key in APP_FEATURE_FLAGS
+    }
+
 def ensure_action_assignment_column(cursor):
     try:
         cursor.execute("ALTER TABLE actions ADD COLUMN assigned_to INT NULL")
@@ -5442,6 +5492,25 @@ def get_user_permissions(current_user: dict = Depends(get_current_user)):
         can_export = result['can_export'] if result and 'can_export' in result else False
         
         return {"can_export": bool(can_export), "is_admin": False}
+
+@api_router.get("/user/feature-flags")
+def get_current_user_feature_flags(current_user: dict = Depends(get_current_user)):
+    """Return the current user's app screen and feature access."""
+    is_admin = str(current_user.get("role") or "").strip().lower() == "admin"
+    if is_admin:
+        return {
+            "is_admin": True,
+            "flags": {key: True for key in APP_FEATURE_FLAGS},
+        }
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_user_feature_flags_table(cursor)
+        conn.commit()
+        return {
+            "is_admin": False,
+            "flags": get_user_feature_flag_values(cursor, int(current_user["id"])),
+        }
 
 @api_router.put("/user/{user_id}/permissions")
 def update_user_permissions(user_id: int, can_export: bool, current_user: dict = Depends(get_current_user)):
