@@ -720,6 +720,7 @@ class LeadCreate(BaseModel):
     Property_locationUrl: Optional[str] = None
     building_facing: Optional[str] = None
     possession_on: Optional[str] = None
+    property_age: Optional[str] = None
     # Amenities as comma-separated string
     required_amenities: Optional[str] = None
     # Legacy individual amenity fields (kept for backward compatibility)
@@ -1913,12 +1914,21 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
 def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)):
     with get_db() as conn:
         cursor = conn.cursor()
+        floor_pricing = getattr(lead, 'floor_pricing', None) or []
+        floor_amounts = []
+        for price_row in floor_pricing:
+            try:
+                amount = float(price_row.get('price') or price_row.get('floor_amount') or 0)
+                if amount > 0:
+                    floor_amounts.append(amount)
+            except (TypeError, ValueError):
+                continue
         
         # Build insert query with all available fields
         fields = ['name', 'phone', 'email', 'lead_type', 'location', 'address', 'bhk', 
                   'budget_min', 'budget_max', 'property_type', 'lead_temperature', 'lead_status', 
                   'lead_source', 'notes', 'floor', 'area_size', 'car_parking_number', 'lift_available', 'unit',
-                  'Property_locationUrl', 'building_facing', 'possession_on', 'builder_id',
+                  'Property_locationUrl', 'building_facing', 'possession_on', 'property_age', 'builder_id',
                   'park_facing', 'park_at_rear', 'wide_road', 'peaceful_location', 'main_road', 'corner',
                   'required_amenities', 'created_at', 'created_by']
         
@@ -1930,8 +1940,8 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
             'location': lead.location,
             'address': getattr(lead, 'address', None),
             'bhk': lead.bhk,
-            'budget_min': lead.budget_min,
-            'budget_max': lead.budget_max,
+            'budget_min': min(floor_amounts) if floor_amounts else lead.budget_min,
+            'budget_max': max(floor_amounts) if floor_amounts else lead.budget_max,
             'property_type': lead.property_type,
             'lead_temperature': lead.lead_temperature,
             'lead_status': lead.lead_status,
@@ -1945,6 +1955,7 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
             'Property_locationUrl': getattr(lead, 'Property_locationUrl', None),
             'building_facing': getattr(lead, 'building_facing', None),
             'possession_on': getattr(lead, 'possession_on', None),
+            'property_age': getattr(lead, 'property_age', None),
             'builder_id': getattr(lead, 'builder_id', None),
             'park_facing': getattr(lead, 'park_facing', 0),
             'park_at_rear': getattr(lead, 'park_at_rear', 0),
@@ -1973,7 +1984,6 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
         lead_id = cursor.lastrowid
         
         # Handle floor pricing if provided
-        floor_pricing = getattr(lead, 'floor_pricing', None)
         if floor_pricing:
             for fp in floor_pricing:
                 if fp.get('floor') and fp.get('price'):
@@ -2014,9 +2024,9 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         allowed_fields = [
             'name', 'phone', 'email', 'lead_type', 'location', 'address',
             'bhk', 'budget_min', 'budget_max', 'property_type',
-            'lead_temperature', 'lead_status', 'notes', 'floor', 'area_size',
+            'lead_temperature', 'lead_status', 'lead_source', 'notes', 'floor', 'area_size',
             'car_parking_number', 'lift_available', 'unit', 'Property_locationUrl',
-            'building_facing', 'possession_on', 'builder_id',
+            'building_facing', 'possession_on', 'property_age', 'builder_id',
             'park_facing', 'park_at_rear', 'wide_road', 'peaceful_location', 'main_road', 'corner',
             'required_amenities'
         ]
@@ -2033,15 +2043,30 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         query = f"UPDATE leads SET {', '.join(update_fields)} WHERE id = %s"
         
         cursor.execute(query, values)
+        lead_update_rowcount = cursor.rowcount
         conn.commit()
         
-        # Handle floor pricing if provided
-        if 'floor_pricing' in lead_data and lead_data['floor_pricing']:
+        # Keep the lead-level price range aligned with Web LMS floor pricing behavior.
+        if 'floor_pricing' in lead_data:
+            floor_amounts = []
+            for price_row in lead_data.get('floor_pricing') or []:
+                try:
+                    amount = float(price_row.get('price') or price_row.get('floor_amount') or 0)
+                    if amount > 0:
+                        floor_amounts.append(amount)
+                except (TypeError, ValueError):
+                    continue
+            if floor_amounts:
+                cursor.execute(
+                    "UPDATE leads SET budget_min = %s, budget_max = %s WHERE id = %s",
+                    (min(floor_amounts), max(floor_amounts), lead_id),
+                )
+
             # Delete existing floor pricing
             cursor.execute("DELETE FROM inventory_floor_pricing WHERE lead_id = %s", (lead_id,))
             
             # Insert new floor pricing
-            for fp in lead_data['floor_pricing']:
+            for fp in lead_data.get('floor_pricing') or []:
                 if fp.get('floor') and fp.get('price'):
                     cursor.execute(
                         """INSERT INTO inventory_floor_pricing (lead_id, floor_label, floor_amount)
@@ -2050,7 +2075,7 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
                     )
             conn.commit()
         
-        if cursor.rowcount == 0:
+        if lead_update_rowcount == 0:
             raise HTTPException(status_code=404, detail="Lead not found")
         
         cursor.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
@@ -4882,6 +4907,61 @@ def get_mobile_enquiries(
                 "floor": floor_count,
             }
         }
+
+class LegacyInventoryStatusUpdate(BaseModel):
+    status: str
+
+@api_router.put("/mobile/legacy-inventory/{source}/{legacy_id}/status")
+def update_mobile_legacy_inventory_status(
+    source: str,
+    legacy_id: int,
+    payload: LegacyInventoryStatusUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update a Kothi or floor legacy record using the Web LMS status set."""
+    table = {"enquiries": "enquiries", "kothis_details": "kothis_details"}.get(source)
+    status = (payload.status or "").strip()
+    allowed_statuses = {
+        "Potential", "Contacted", "Pending", "Converted",
+        "Not Interested", "Invalid Number", "Sold", "Not Picking Call",
+    }
+    if not table:
+        raise HTTPException(status_code=400, detail="Unsupported legacy inventory source")
+    if status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Invalid legacy inventory status")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE {table} SET status = %s WHERE id = %s AND (is_deleted IS NULL OR is_deleted != 1)",
+            (status, legacy_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Legacy inventory record not found")
+        conn.commit()
+    return {"message": "Legacy status updated", "id": legacy_id, "source": source, "status": status}
+
+@api_router.delete("/mobile/legacy-inventory/{source}/{legacy_id}")
+def delete_mobile_legacy_inventory(
+    source: str,
+    legacy_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Soft-delete a legacy inventory record."""
+    table = {"enquiries": "enquiries", "kothis_details": "kothis_details"}.get(source)
+    if not table:
+        raise HTTPException(status_code=400, detail="Unsupported legacy inventory source")
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE {table} SET is_deleted = 1 WHERE id = %s AND (is_deleted IS NULL OR is_deleted != 1)",
+            (legacy_id,),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Legacy inventory record not found")
+        conn.commit()
+    return {"message": "Legacy inventory deleted", "id": legacy_id, "source": source}
 
 @api_router.post("/mobile/enquiries/{enquiry_id}/convert")
 def convert_mobile_enquiry(enquiry_id: int, current_user: dict = Depends(get_current_user)):
