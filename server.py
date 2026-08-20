@@ -1690,35 +1690,13 @@ def get_leads_for_map(lead_type: Optional[str] = None, current_user: dict = Depe
         ensure_collaboration_tables(cursor)
         conn.commit()
         
-        # First check if locations table exists and has latitude/longitude columns
-        try:
-            cursor.execute("SHOW COLUMNS FROM locations LIKE 'latitude'")
-            has_latitude = cursor.fetchone() is not None
-            cursor.execute("SHOW COLUMNS FROM locations LIKE 'longitude'")
-            has_longitude = cursor.fetchone() is not None
-            has_coordinates = has_latitude and has_longitude
-        except:
-            has_coordinates = False
-        
-        if has_coordinates:
-            query = """
-                SELECT l.id, l.name, l.lead_type, l.location, l.address, l.Property_locationUrl,
-                       l.budget_min, l.budget_max, l.bhk, l.area_size, l.created_by, l.assigned_to,
-                       loc.latitude, loc.longitude
-                FROM leads l
-                LEFT JOIN locations loc ON LOWER(l.location) LIKE CONCAT('%%', LOWER(loc.name), '%%')
-                WHERE (l.is_deleted IS NULL OR l.is_deleted = 0)
-                AND l.location IS NOT NULL AND l.location != ''
-            """
-        else:
-            query = """
-                SELECT l.id, l.name, l.lead_type, l.location, l.address, l.Property_locationUrl,
-                       l.budget_min, l.budget_max, l.bhk, l.area_size, l.created_by, l.assigned_to,
-                       NULL as latitude, NULL as longitude
-                FROM leads l
-                WHERE (l.is_deleted IS NULL OR l.is_deleted = 0)
-                AND l.location IS NOT NULL AND l.location != ''
-            """
+        query = """
+            SELECT l.id, l.name, l.lead_type, l.location, l.address, l.Property_locationUrl,
+                   l.budget_min, l.budget_max, l.bhk, l.area_size, l.created_by, l.assigned_to
+            FROM leads l
+            WHERE (l.is_deleted IS NULL OR l.is_deleted = 0)
+              AND NULLIF(TRIM(l.location), '') IS NOT NULL
+        """
         
         params = []
         
@@ -1726,7 +1704,7 @@ def get_leads_for_map(lead_type: Optional[str] = None, current_user: dict = Depe
             query += " AND l.lead_type = %s"
             params.append(lead_type)
         
-        query += " LIMIT 100"
+        query += " ORDER BY COALESCE(l.updated_on, l.created_at) DESC LIMIT 5000"
         cursor.execute(query, params)
         leads = cursor.fetchall()
         attach_current_assignees(cursor, leads)
@@ -5376,6 +5354,7 @@ def respond_to_lead_handoff(
 def get_mobile_performance(
     days: int = 30,
     agent_id: Optional[int] = None,
+    detail_metric: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
 ):
     role = str(current_user.get('role') or '').strip().lower()
@@ -5491,10 +5470,10 @@ def get_mobile_performance(
                    l.name AS lead_name
             FROM actions a
             LEFT JOIN leads l ON l.id = a.lead_id
-            WHERE {owner_expr} = %s AND a.due_date BETWEEN %s AND %s
+            WHERE %s = 1 AND {owner_expr} = %s AND a.due_date BETWEEN %s AND %s
             ORDER BY a.due_date DESC, a.due_time DESC
             LIMIT 5000
-        """, (selected_agent_id, from_date, today))
+        """, (detail_metric in {'due_completed', 'completion', 'on_time'}, selected_agent_id, from_date, today))
         due_action_items = [dict(row) for row in cursor.fetchall()]
 
         cursor.execute("""
@@ -5502,7 +5481,7 @@ def get_mobile_performance(
                    l.lead_temperature, l.location, l.budget_min, l.budget_max,
                    l.unit, l.created_at
             FROM leads l
-            WHERE (l.is_deleted IS NULL OR l.is_deleted = 0)
+            WHERE %s = 1 AND (l.is_deleted IS NULL OR l.is_deleted = 0)
               AND LOWER(IFNULL(l.lead_status,'')) NOT IN ('sold','closed','closed/lost','already rented')
               AND (
                   l.created_by = %s OR l.assigned_to = %s OR EXISTS (
@@ -5512,19 +5491,19 @@ def get_mobile_performance(
               )
             ORDER BY COALESCE(l.updated_on, l.created_at) DESC
             LIMIT 5000
-        """, (selected_agent_id, selected_agent_id, selected_agent_id))
+        """, (detail_metric == 'portfolio', selected_agent_id, selected_agent_id, selected_agent_id))
         portfolio_items = [dict(row) for row in cursor.fetchall()]
 
         cursor.execute("""
             SELECT id, name, phone, lead_type, lead_status, lead_temperature,
                    location, budget_min, budget_max, unit, created_at
             FROM leads
-            WHERE created_by = %s
+            WHERE %s = 1 AND created_by = %s
               AND (is_deleted IS NULL OR is_deleted = 0)
               AND DATE(created_at) BETWEEN %s AND %s
             ORDER BY created_at DESC
             LIMIT 5000
-        """, (selected_agent_id, from_date, today))
+        """, (detail_metric in {'new_leads', 'won'}, selected_agent_id, from_date, today))
         new_lead_items = [dict(row) for row in cursor.fetchall()]
         won_lead_items = [
             row for row in new_lead_items
@@ -5532,7 +5511,7 @@ def get_mobile_performance(
         ]
 
         visit_items = []
-        if _table_exists(cursor, 'site_visits') and owner_column:
+        if detail_metric == 'visits' and _table_exists(cursor, 'site_visits') and owner_column:
             cursor.execute(f"""
                 SELECT * FROM site_visits
                 WHERE {owner_column} = %s AND DATE({date_column}) BETWEEN %s AND %s
@@ -5565,12 +5544,12 @@ def get_mobile_performance(
                    TIMESTAMPDIFF(HOUR, CONCAT(a.due_date, ' ', COALESCE(a.due_time, '23:59:59')), NOW()) AS hours_overdue
             FROM actions a
             LEFT JOIN leads l ON l.id = a.lead_id
-            WHERE {owner_expr} = %s
+            WHERE %s = 1 AND {owner_expr} = %s
               AND a.status IN ('Pending','Missed','Up Coming')
               AND CONCAT(a.due_date, ' ', COALESCE(a.due_time, '23:59:59')) < NOW()
             ORDER BY hours_overdue DESC
             LIMIT 5000
-        """, (selected_agent_id,))
+        """, (detail_metric == 'current_overdue', selected_agent_id))
         all_overdue_items = [dict(row) for row in cursor.fetchall()]
 
         available_agents = []
