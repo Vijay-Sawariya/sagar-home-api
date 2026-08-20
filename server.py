@@ -209,6 +209,7 @@ APP_FEATURE_FLAGS = {
     "assigned_leads": "Assigned Leads",
     "team_inbox": "Team Inbox",
     "agent_performance": "Performance",
+    "cold_calling_inventory": "Cold Calling Inventory",
     "site_visits": "Site Visits",
     "activity_feed": "Activity",
     "lead_map": "Lead Map",
@@ -710,6 +711,7 @@ class LeadCreate(BaseModel):
     lead_temperature: Optional[str] = "Hot"
     lead_status: Optional[str] = "New"
     lead_source: Optional[str] = None
+    source_type: Optional[str] = None
     notes: Optional[str] = None
     builder_id: Optional[int] = None
     floor: Optional[str] = None
@@ -1953,7 +1955,7 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
         # Build insert query with all available fields
         fields = ['name', 'phone', 'email', 'lead_type', 'location', 'address', 'bhk', 
                   'budget_min', 'budget_max', 'property_type', 'lead_temperature', 'lead_status', 
-                  'lead_source', 'notes', 'floor', 'area_size', 'car_parking_number', 'lift_available', 'unit',
+                  'lead_source', 'source_type', 'notes', 'floor', 'area_size', 'car_parking_number', 'lift_available', 'unit',
                   'Property_locationUrl', 'building_facing', 'possession_on', 'property_age', 'builder_id',
                   'park_facing', 'park_at_rear', 'wide_road', 'peaceful_location', 'main_road', 'corner',
                   'required_amenities', 'created_at', 'created_by']
@@ -1972,6 +1974,7 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
             'lead_temperature': lead.lead_temperature,
             'lead_status': lead.lead_status,
             'lead_source': getattr(lead, 'lead_source', None),
+            'source_type': getattr(lead, 'source_type', None) or getattr(lead, 'lead_source', None),
             'notes': lead.notes,
             'floor': getattr(lead, 'floor', None),
             'area_size': getattr(lead, 'area_size', None),
@@ -2050,7 +2053,7 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         allowed_fields = [
             'name', 'phone', 'email', 'lead_type', 'location', 'address',
             'bhk', 'budget_min', 'budget_max', 'property_type',
-            'lead_temperature', 'lead_status', 'lead_source', 'notes', 'floor', 'area_size',
+            'lead_temperature', 'lead_status', 'lead_source', 'source_type', 'notes', 'floor', 'area_size',
             'car_parking_number', 'lift_available', 'unit', 'Property_locationUrl',
             'building_facing', 'possession_on', 'property_age', 'builder_id',
             'park_facing', 'park_at_rear', 'wide_road', 'peaceful_location', 'main_road', 'corner',
@@ -5375,9 +5378,12 @@ def get_mobile_performance(
     agent_id: Optional[int] = None,
     current_user: dict = Depends(get_current_user),
 ):
-    safe_days = max(7, min(days, 90))
     role = str(current_user.get('role') or '').strip().lower()
-    selected_agent_id = agent_id if role in {'admin', 'manager'} and agent_id else current_user['id']
+    if role != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    safe_days = max(7, min(days, 90))
+    selected_agent_id = agent_id or current_user['id']
     from_date = datetime.utcnow().date() - timedelta(days=safe_days - 1)
     today = datetime.utcnow().date()
 
@@ -5413,6 +5419,15 @@ def get_mobile_performance(
             WHERE {owner_expr} = %s AND a.due_date BETWEEN %s AND %s
         """, (selected_agent_id, from_date, today))
         action_stats = dict(cursor.fetchone() or {})
+
+        cursor.execute(f"""
+            SELECT COUNT(*) AS current_overdue
+            FROM actions a
+            WHERE {owner_expr} = %s
+              AND a.status IN ('Pending','Missed','Up Coming')
+              AND CONCAT(a.due_date, ' ', COALESCE(a.due_time, '23:59:59')) < NOW()
+        """, (selected_agent_id,))
+        current_overdue = int((cursor.fetchone() or {}).get('current_overdue') or 0)
 
         cursor.execute("""
             SELECT COUNT(DISTINCT l.id) AS open_portfolio
@@ -5453,7 +5468,7 @@ def get_mobile_performance(
         due = int(action_stats.get('actions_due') or 0)
         completed = int(action_stats.get('actions_completed') or 0)
         on_time = int(action_stats.get('completed_on_time') or 0)
-        overdue = int(action_stats.get('overdue_actions') or 0)
+        overdue = current_overdue
         summary = {
             "actions_due": due,
             "actions_completed": completed,
@@ -5486,7 +5501,7 @@ def get_mobile_performance(
         overdue_items = [dict(row) for row in cursor.fetchall()]
 
         available_agents = []
-        if role in {'admin', 'manager'}:
+        if role == 'admin':
             cursor.execute("""
                 SELECT id, username, full_name, role
                 FROM users
