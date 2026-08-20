@@ -70,7 +70,26 @@ def should_mask_data(
     # Everyone else gets masked data
     return True
 
-def apply_lead_masking(lead: dict, user_role: str, user_id: int) -> dict:
+def get_detail_access_map(cursor, user_id: int, lead_ids: List[int]) -> Dict[int, str]:
+    """Load one user's access state for a set of leads in one query."""
+    ensure_collaboration_tables(cursor)
+    clean_ids = sorted({int(item) for item in lead_ids if int(item) > 0})
+    if not clean_ids:
+        return {}
+    placeholders = ','.join(['%s'] * len(clean_ids))
+    cursor.execute(f"""
+        SELECT lead_id, status
+        FROM lead_detail_access_requests
+        WHERE requester_id = %s AND lead_id IN ({placeholders})
+    """, [user_id, *clean_ids])
+    return {int(row['lead_id']): row['status'] for row in cursor.fetchall()}
+
+def apply_lead_masking(
+    lead: dict,
+    user_role: str,
+    user_id: int,
+    detail_access_status: Optional[str] = None,
+) -> dict:
     """Apply masking to a lead based on user permissions"""
     created_by = lead.get('created_by')
     assigned_to = (
@@ -78,13 +97,19 @@ def apply_lead_masking(lead: dict, user_role: str, user_id: int) -> dict:
         or lead.get('assigned_to')
         or lead.get('assigned_user_id')
     )
-    can_view_sensitive = not should_mask_data(user_role, user_id, created_by, assigned_to)
+    can_view_sensitive = (
+        not should_mask_data(user_role, user_id, created_by, assigned_to)
+        or detail_access_status == 'approved'
+    )
     lead['can_view_sensitive'] = can_view_sensitive
+    lead['detail_access_status'] = detail_access_status
     if not can_view_sensitive:
         if lead.get('phone'):
             lead['phone'] = mask_phone(lead['phone'])
         if lead.get('address'):
             lead['address'] = mask_address(lead['address'])
+        if lead.get('email'):
+            lead['email'] = None
         if 'Property_locationUrl' in lead:
             lead['Property_locationUrl'] = None
         if 'property_location_url' in lead:
@@ -92,6 +117,15 @@ def apply_lead_masking(lead: dict, user_role: str, user_id: int) -> dict:
         if 'location_url' in lead:
             lead['location_url'] = None
     return lead
+
+def apply_lead_masking_batch(cursor, leads: List[dict], current_user: dict) -> List[dict]:
+    """Mask a lead collection without an N+1 access-request lookup."""
+    user_id = int(current_user.get('id') or 0)
+    access_map = get_detail_access_map(cursor, user_id, [lead['id'] for lead in leads])
+    return [
+        apply_lead_masking(dict(lead), current_user.get('role', ''), user_id, access_map.get(int(lead['id'])))
+        for lead in leads
+    ]
 
 def current_assignee_map(cursor, lead_ids: List[int]) -> Dict[int, Optional[int]]:
     """Resolve the current owner from web assignments, falling back to leads.assigned_to."""
@@ -352,6 +386,21 @@ def ensure_collaboration_tables(cursor):
             responded_at DATETIME NULL,
             INDEX idx_handoff_lead_status (lead_id, status),
             INDEX idx_handoff_recipient_status (to_user_id, status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS lead_detail_access_requests (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            lead_id INT NOT NULL,
+            requester_id INT NOT NULL,
+            creator_id INT NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'pending',
+            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            responded_at DATETIME NULL,
+            responded_by INT NULL,
+            UNIQUE KEY uniq_lead_detail_request (lead_id, requester_id),
+            INDEX idx_detail_request_creator_status (creator_id, status, requested_at),
+            INDEX idx_detail_request_requester_status (requester_id, status, requested_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """)
     cursor.execute("""
@@ -696,6 +745,8 @@ class LeadResponse(BaseModel):
     notes: Optional[str] = None
     created_at: Optional[datetime] = None
     builder_id: Optional[int] = None
+    can_view_sensitive: bool = False
+    detail_access_status: Optional[str] = None
 
 class LeadCreate(BaseModel):
     name: str
@@ -782,6 +833,9 @@ class CollaborationHandoffCreate(BaseModel):
     note: Optional[str] = None
 
 class CollaborationHandoffResponse(BaseModel):
+    decision: str
+
+class DetailAccessResponse(BaseModel):
     decision: str
 
 class DashboardStats(BaseModel):
@@ -1168,9 +1222,8 @@ def get_client_leads(
                 lead['aging_urgency'] = aging['urgency']
     
     # Apply masking based on user permissions
-    user_role = current_user.get('role', '')
-    user_id = current_user.get('id')
-    masked_leads = [apply_lead_masking(dict(lead), user_role, user_id) for lead in leads]
+    with get_db() as conn:
+        masked_leads = apply_lead_masking_batch(conn.cursor(), leads, current_user)
     
     return masked_leads
 
@@ -1350,6 +1403,7 @@ def get_matching_inventory(
         """, (lead_id,))
         candidates = cursor.fetchall()
         attach_current_assignees(cursor, candidates)
+        detail_access_map = get_detail_access_map(cursor, current_user['id'], [row['id'] for row in candidates])
         pricing_map = _get_floor_pricing_map(cursor, [row['id'] for row in candidates])
 
         cursor.execute(
@@ -1389,7 +1443,7 @@ def get_matching_inventory(
         # Apply masking based on user permissions
         user_role = current_user.get('role', '')
         user_id = current_user.get('id')
-        item = apply_lead_masking(item, user_role, user_id)
+        item = apply_lead_masking(item, user_role, user_id, detail_access_map.get(row['id']))
         matches.append(item)
 
     return {"lead_id": lead_id, "defaults": defaults, "filters": {
@@ -1453,6 +1507,7 @@ def get_matching_clients(
         """, [lead_id, *target_types])
         candidates = cursor.fetchall()
         attach_current_assignees(cursor, candidates)
+        detail_access_map = get_detail_access_map(cursor, current_user['id'], [row['id'] for row in candidates])
 
         cursor.execute(
             "SELECT lead_id FROM preferred_leads WHERE matching_lead_id = %s AND lead_id IS NOT NULL",
@@ -1492,7 +1547,7 @@ def get_matching_clients(
         # Apply masking based on user permissions
         user_role = current_user.get('role', '')
         user_id = current_user.get('id')
-        item = apply_lead_masking(item, user_role, user_id)
+        item = apply_lead_masking(item, user_role, user_id, detail_access_map.get(row['id']))
         matches.append(item)
 
     return {"lead_id": lead_id, "defaults": defaults, "filters": {
@@ -1623,9 +1678,8 @@ def get_inventory_leads(
                 lead['aging_urgency'] = aging['urgency']
     
     # Apply masking based on user permissions
-    user_role = current_user.get('role', '')
-    user_id = current_user.get('id')
-    masked_leads = [apply_lead_masking(dict(lead), user_role, user_id) for lead in leads]
+    with get_db() as conn:
+        masked_leads = apply_lead_masking_batch(conn.cursor(), leads, current_user)
     
     return masked_leads
 
@@ -1652,11 +1706,7 @@ def search_leads(q: str, current_user: dict = Depends(get_current_user)):
         )
         leads = cursor.fetchall()
         attach_current_assignees(cursor, leads)
-
-    return [
-        apply_lead_masking(dict(lead), current_user.get('role', ''), current_user.get('id'))
-        for lead in leads
-    ]
+        return apply_lead_masking_batch(cursor, leads, current_user)
 
 @api_router.get("/leads", response_model=List[LeadResponse])
 def get_all_leads(
@@ -1675,11 +1725,7 @@ def get_all_leads(
         )
         leads = cursor.fetchall()
         attach_current_assignees(cursor, leads)
-
-    masked = [
-        apply_lead_masking(dict(lead), current_user.get('role', ''), current_user.get('id'))
-        for lead in leads
-    ]
+        masked = apply_lead_masking_batch(cursor, leads, current_user)
     return [LeadResponse(**lead) for lead in masked]
 
 @api_router.get("/leads/map-data")
@@ -1708,10 +1754,7 @@ def get_leads_for_map(lead_type: Optional[str] = None, current_user: dict = Depe
         cursor.execute(query, params)
         leads = cursor.fetchall()
         attach_current_assignees(cursor, leads)
-        return [
-            apply_lead_masking(dict(lead), current_user.get('role', ''), current_user.get('id'))
-            for lead in leads
-        ]
+        return apply_lead_masking_batch(cursor, leads, current_user)
 
 @api_router.get("/leads/export")
 def export_leads(
@@ -1746,10 +1789,7 @@ def export_leads(
         cursor.execute(query, params)
         leads = cursor.fetchall()
         attach_current_assignees(cursor, leads)
-        leads = [
-            apply_lead_masking(dict(lead), current_user.get('role', ''), current_user.get('id'))
-            for lead in leads
-        ]
+        leads = apply_lead_masking_batch(cursor, leads, current_user)
         log_security_event(cursor, current_user['id'], "leads_exported", "leads", None, {
             "lead_type": lead_type,
             "category": selected_category or "all",
@@ -1781,7 +1821,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
     with get_db() as conn:
         cursor = conn.cursor()
         ensure_collaboration_tables(cursor)
-        cursor.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
+        cursor.execute("SELECT * FROM leads WHERE id = %s AND (is_deleted IS NULL OR is_deleted = 0)", (lead_id,))
         lead = cursor.fetchone()
         
         if not lead:
@@ -1794,6 +1834,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
         )
         floor_pricing_rows = cursor.fetchall()
         attach_current_assignees(cursor, [lead])
+        access_status = get_detail_access_map(cursor, current_user['id'], [lead_id]).get(lead_id)
         
     # Build floor pricing list
     floor_pricing = []
@@ -1914,7 +1955,9 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
     else:
         response['matched_properties'] = []
     
-    return apply_lead_masking(response, current_user.get('role', ''), current_user.get('id'))
+    return apply_lead_masking(
+        response, current_user.get('role', ''), current_user.get('id'), access_status
+    )
 
 @api_router.post("/leads", response_model=LeadResponse)
 def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)):
@@ -2204,11 +2247,7 @@ def get_builder_leads(builder_id: int, current_user: dict = Depends(get_current_
             for lead in leads:
                 lead['floor_pricing'] = floor_pricing_map.get(lead['id'], [])
         attach_current_assignees(cursor, leads)
-
-    return [
-        apply_lead_masking(dict(lead), current_user.get('role', ''), current_user.get('id'))
-        for lead in leads
-    ]
+        return apply_lead_masking_batch(cursor, leads, current_user)
 
 @api_router.post("/builders", response_model=BuilderResponse)
 def create_builder(builder: BuilderCreate, current_user: dict = Depends(get_current_user)):
@@ -5018,6 +5057,9 @@ def get_collaboration_inbox(limit: int = 80, current_user: dict = Depends(get_cu
         conn.commit()
         cursor.execute("""
             SELECT n.*, l.name AS lead_name,
+                   CASE WHEN n.notification_type = 'detail_access_request' THEN dar.status ELSE NULL END AS detail_access_status,
+                   CASE WHEN n.notification_type = 'detail_access_request' THEN dar.requester_id ELSE NULL END AS requester_id,
+                   CASE WHEN n.notification_type = 'detail_access_request' THEN dar.creator_id ELSE NULL END AS creator_id,
                    CASE
                      WHEN n.notification_type = 'handoff' THEN (
                        SELECT h.status FROM lead_handoffs h WHERE h.id = n.reference_id
@@ -5026,6 +5068,8 @@ def get_collaboration_inbox(limit: int = 80, current_user: dict = Depends(get_cu
                    END AS handoff_status
             FROM collaboration_notifications n
             LEFT JOIN leads l ON l.id = n.lead_id
+            LEFT JOIN lead_detail_access_requests dar
+              ON n.notification_type = 'detail_access_request' AND dar.id = n.reference_id
             WHERE n.user_id = %s
             ORDER BY n.is_read ASC, n.created_at DESC, n.id DESC
             LIMIT %s
@@ -5033,6 +5077,125 @@ def get_collaboration_inbox(limit: int = 80, current_user: dict = Depends(get_cu
         rows = [dict(row) for row in cursor.fetchall()]
         unread = sum(1 for row in rows if not row.get('is_read'))
         return {"unread": unread, "items": rows}
+
+@api_router.post("/leads/{lead_id}/detail-access-request")
+def request_lead_detail_access(lead_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_collaboration_tables(cursor)
+        conn.begin()
+        try:
+            cursor.execute("""
+                SELECT * FROM leads
+                WHERE id = %s AND (is_deleted IS NULL OR is_deleted = 0)
+                FOR UPDATE
+            """, (lead_id,))
+            lead = cursor.fetchone()
+            if not lead:
+                raise HTTPException(status_code=404, detail="Lead not found")
+            attach_current_assignees(cursor, [lead])
+            creator_id = int(lead.get('created_by') or 0)
+            if creator_id <= 0:
+                raise HTTPException(status_code=409, detail="This lead has no creator to approve access")
+            if creator_id == current_user['id']:
+                raise HTTPException(status_code=400, detail="You already own this lead")
+
+            existing_map = get_detail_access_map(cursor, current_user['id'], [lead_id])
+            existing_status = existing_map.get(lead_id)
+            if not should_mask_data(
+                current_user.get('role', ''), current_user['id'], creator_id,
+                lead.get('current_assignee_id') or lead.get('assigned_to')
+            ) or existing_status == 'approved':
+                if existing_status == 'approved':
+                    cursor.execute("SELECT id FROM lead_detail_access_requests WHERE lead_id=%s AND requester_id=%s", (lead_id, current_user['id']))
+                    request_id = cursor.fetchone()['id']
+                    conn.commit()
+                    return {"message": "Access is already approved", "request_id": request_id, "status": "approved"}
+                raise HTTPException(status_code=400, detail="You already have access to this lead")
+
+            cursor.execute("SELECT id, status FROM lead_detail_access_requests WHERE lead_id=%s AND requester_id=%s FOR UPDATE", (lead_id, current_user['id']))
+            request_row = cursor.fetchone()
+            if request_row and request_row['status'] == 'pending':
+                conn.commit()
+                return {"message": "Access request is already pending", "request_id": request_row['id'], "status": "pending"}
+            if request_row:
+                request_id = request_row['id']
+                cursor.execute("""
+                    UPDATE lead_detail_access_requests
+                    SET status='pending', requested_at=NOW(), responded_at=NULL, responded_by=NULL
+                    WHERE id=%s
+                """, (request_id,))
+            else:
+                cursor.execute("""
+                    INSERT INTO lead_detail_access_requests (lead_id, requester_id, creator_id, status)
+                    VALUES (%s, %s, %s, 'pending')
+                """, (lead_id, current_user['id'], creator_id))
+                request_id = cursor.lastrowid
+            requester = current_user.get('full_name') or current_user.get('username') or 'A teammate'
+            cursor.execute("""
+                INSERT INTO collaboration_notifications
+                    (user_id, lead_id, notification_type, reference_id, message)
+                VALUES (%s, %s, 'detail_access_request', %s, %s)
+            """, (creator_id, lead_id, request_id,
+                  f"{requester} requested permission to view this lead's phone and address."))
+            conn.commit()
+            return {"message": "Access request sent", "request_id": request_id, "status": "pending"}
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+
+@api_router.put("/collaboration/detail-access/{request_id}")
+def respond_to_lead_detail_access(
+    request_id: int,
+    payload: DetailAccessResponse,
+    current_user: dict = Depends(get_current_user),
+):
+    decision = payload.decision.strip().lower()
+    if decision not in {'approved', 'declined'}:
+        raise HTTPException(status_code=400, detail="Decision must be approved or declined")
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_collaboration_tables(cursor)
+        conn.begin()
+        try:
+            cursor.execute("SELECT * FROM lead_detail_access_requests WHERE id=%s FOR UPDATE", (request_id,))
+            request_row = cursor.fetchone()
+            if not request_row:
+                raise HTTPException(status_code=404, detail="Access request not found")
+            if int(request_row['creator_id']) != int(current_user['id']):
+                raise HTTPException(status_code=403, detail="Only the lead creator can change access")
+            cursor.execute("""
+                UPDATE lead_detail_access_requests
+                SET status=%s, responded_at=NOW(), responded_by=%s WHERE id=%s
+            """, (decision, current_user['id'], request_id))
+            cursor.execute("""
+                UPDATE collaboration_notifications SET is_read=1, read_at=NOW()
+                WHERE user_id=%s AND notification_type='detail_access_request' AND reference_id=%s
+            """, (current_user['id'], request_id))
+            responder = current_user.get('full_name') or current_user.get('username') or 'The lead creator'
+            verb = 'approved' if decision == 'approved' else 'revoked/declined'
+            cursor.execute("""
+                INSERT INTO collaboration_notifications
+                    (user_id, lead_id, notification_type, reference_id, message)
+                VALUES (%s, %s, 'detail_access_response', %s, %s)
+            """, (request_row['requester_id'], request_row['lead_id'], request_id,
+                  f"{responder} {verb} access to this lead's phone and address."))
+            conn.commit()
+            return {
+                "message": "Lead detail access approved" if decision == 'approved' else "Lead detail access declined or revoked",
+                "request_id": request_id,
+                "lead_id": request_row['lead_id'],
+                "status": decision,
+            }
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            raise
 
 @api_router.put("/collaboration/inbox/read")
 def mark_collaboration_inbox_read(current_user: dict = Depends(get_current_user)):
