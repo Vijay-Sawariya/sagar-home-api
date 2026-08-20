@@ -1061,7 +1061,7 @@ def get_aging_label(days: Optional[int]) -> dict:
 @api_router.get("/leads/clients")
 def get_client_leads(
     skip: int = 0,
-    limit: int = 1000,
+    limit: int = 5000,
     current_user: dict = Depends(get_current_user)
 ):
     """Get CLIENT leads (buyer, tenant) - excludes deleted, includes next action/followup and lead scoring"""
@@ -1073,7 +1073,7 @@ def get_client_leads(
                LEFT JOIN users u ON l.created_by = u.id
                WHERE l.lead_type IN ('buyer', 'tenant') 
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-               ORDER BY l.created_at DESC LIMIT %s OFFSET %s""",
+               ORDER BY COALESCE(l.updated_on, l.created_at) DESC, l.created_at DESC LIMIT %s OFFSET %s""",
             (limit, skip)
         )
         leads = cursor.fetchall()
@@ -1524,7 +1524,7 @@ def add_preferred_leads(
 @api_router.get("/leads/inventory")
 def get_inventory_leads(
     skip: int = 0,
-    limit: int = 1000,
+    limit: int = 5000,
     current_user: dict = Depends(get_current_user)
 ):
     """Get INVENTORY leads (seller, landlord, builder) with floor pricing, scoring, and aging - excludes deleted"""
@@ -1536,7 +1536,7 @@ def get_inventory_leads(
                LEFT JOIN users u ON l.created_by = u.id
                WHERE l.lead_type IN ('seller', 'landlord', 'builder', 'agent') 
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-               ORDER BY l.created_at DESC LIMIT %s OFFSET %s""",
+               ORDER BY COALESCE(l.updated_on, l.created_at) DESC, l.created_at DESC LIMIT %s OFFSET %s""",
             (limit, skip)
         )
         leads = cursor.fetchall()
