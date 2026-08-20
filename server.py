@@ -5454,6 +5454,8 @@ def get_mobile_performance(
         lead_stats = dict(cursor.fetchone() or {})
 
         visits = 0
+        owner_column = None
+        date_column = 'created_at'
         if _table_exists(cursor, 'site_visits'):
             visit_columns = _table_columns(cursor, 'site_visits')
             owner_column = 'created_by' if 'created_by' in visit_columns else None
@@ -5484,6 +5486,63 @@ def get_mobile_performance(
 
         cursor.execute(f"""
             SELECT a.id, a.lead_id, a.title, a.action_type, a.due_date, a.due_time,
+                   a.status, a.completed_at,
+                   (a.completed_at IS NOT NULL AND a.completed_at <= CONCAT(a.due_date, ' ', COALESCE(a.due_time, '23:59:59'))) AS is_on_time,
+                   l.name AS lead_name
+            FROM actions a
+            LEFT JOIN leads l ON l.id = a.lead_id
+            WHERE {owner_expr} = %s AND a.due_date BETWEEN %s AND %s
+            ORDER BY a.due_date DESC, a.due_time DESC
+            LIMIT 5000
+        """, (selected_agent_id, from_date, today))
+        due_action_items = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("""
+            SELECT l.id, l.name, l.phone, l.lead_type, l.lead_status,
+                   l.lead_temperature, l.location, l.budget_min, l.budget_max,
+                   l.unit, l.created_at
+            FROM leads l
+            WHERE (l.is_deleted IS NULL OR l.is_deleted = 0)
+              AND LOWER(IFNULL(l.lead_status,'')) NOT IN ('sold','closed','closed/lost','already rented')
+              AND (
+                  l.created_by = %s OR l.assigned_to = %s OR EXISTS (
+                      SELECT 1 FROM lead_assignments la
+                      WHERE la.lead_id = l.id AND la.user_id = %s
+                  )
+              )
+            ORDER BY COALESCE(l.updated_on, l.created_at) DESC
+            LIMIT 5000
+        """, (selected_agent_id, selected_agent_id, selected_agent_id))
+        portfolio_items = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("""
+            SELECT id, name, phone, lead_type, lead_status, lead_temperature,
+                   location, budget_min, budget_max, unit, created_at
+            FROM leads
+            WHERE created_by = %s
+              AND (is_deleted IS NULL OR is_deleted = 0)
+              AND DATE(created_at) BETWEEN %s AND %s
+            ORDER BY created_at DESC
+            LIMIT 5000
+        """, (selected_agent_id, from_date, today))
+        new_lead_items = [dict(row) for row in cursor.fetchall()]
+        won_lead_items = [
+            row for row in new_lead_items
+            if str(row.get('lead_status') or '').strip().lower() == 'won'
+        ]
+
+        visit_items = []
+        if _table_exists(cursor, 'site_visits') and owner_column:
+            cursor.execute(f"""
+                SELECT * FROM site_visits
+                WHERE {owner_column} = %s AND DATE({date_column}) BETWEEN %s AND %s
+                ORDER BY {date_column} DESC
+                LIMIT 5000
+            """, (selected_agent_id, from_date, today))
+            visit_items = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(f"""
+            SELECT a.id, a.lead_id, a.title, a.action_type, a.due_date, a.due_time,
                    l.name AS lead_name,
                    TIMESTAMPDIFF(
                      HOUR,
@@ -5499,6 +5558,20 @@ def get_mobile_performance(
             LIMIT 10
         """, (selected_agent_id,))
         overdue_items = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute(f"""
+            SELECT a.id, a.lead_id, a.title, a.action_type, a.due_date, a.due_time,
+                   a.status, l.name AS lead_name,
+                   TIMESTAMPDIFF(HOUR, CONCAT(a.due_date, ' ', COALESCE(a.due_time, '23:59:59')), NOW()) AS hours_overdue
+            FROM actions a
+            LEFT JOIN leads l ON l.id = a.lead_id
+            WHERE {owner_expr} = %s
+              AND a.status IN ('Pending','Missed','Up Coming')
+              AND CONCAT(a.due_date, ' ', COALESCE(a.due_time, '23:59:59')) < NOW()
+            ORDER BY hours_overdue DESC
+            LIMIT 5000
+        """, (selected_agent_id,))
+        all_overdue_items = [dict(row) for row in cursor.fetchall()]
 
         available_agents = []
         if role == 'admin':
@@ -5517,6 +5590,16 @@ def get_mobile_performance(
             "to": today.isoformat(),
             "summary": summary,
             "overdue": overdue_items,
+            "details": {
+                "due_completed": [row for row in due_action_items if row.get('status') == 'Completed'],
+                "current_overdue": all_overdue_items,
+                "completion": due_action_items,
+                "on_time": [row for row in due_action_items if row.get('is_on_time')],
+                "portfolio": portfolio_items,
+                "visits": visit_items,
+                "new_leads": new_lead_items,
+                "won": won_lead_items,
+            },
             "agents": available_agents,
         }
 
