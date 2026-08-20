@@ -1534,7 +1534,7 @@ def get_inventory_leads(
             """SELECT l.*, u.full_name as created_by_name 
                FROM leads l
                LEFT JOIN users u ON l.created_by = u.id
-               WHERE l.lead_type IN ('seller', 'landlord', 'builder', 'agent') 
+               WHERE l.lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent')
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
                ORDER BY COALESCE(l.updated_on, l.created_at) DESC, l.created_at DESC LIMIT %s OFFSET %s""",
             (limit, skip)
@@ -1801,7 +1801,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
     calculations = {}
     
     # Only calculate for inventory leads with required data
-    if lead.get('lead_type') in ['seller', 'landlord', 'builder', 'agent'] and lead.get('area_size') and lead.get('location'):
+    if lead.get('lead_type') in ['seller', 'owner', 'landlord', 'builder', 'agent'] and lead.get('area_size') and lead.get('location'):
         try:
             # Get floors from the floor column directly
             floors_str = lead.get('floor', '')
@@ -2719,7 +2719,7 @@ def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         client_leads = cursor.fetchone()['count']
         
         # Inventory leads (seller, landlord, builder) - exclude deleted
-        cursor.execute("SELECT COUNT(*) as count FROM leads WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent') AND (is_deleted IS NULL OR is_deleted = 0)")
+        cursor.execute("SELECT COUNT(*) as count FROM leads WHERE lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent') AND (is_deleted IS NULL OR is_deleted = 0)")
         inventory_leads = cursor.fetchone()['count']
         
         # Temperature counts - exclude deleted
@@ -2848,7 +2848,7 @@ def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
         cursor.execute("""
             SELECT COUNT(*) as count
             FROM leads
-            WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent')
+            WHERE lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent')
             AND (is_deleted IS NULL OR is_deleted = 0)
             AND (lead_status IS NULL OR lead_status NOT IN ('Won', 'Closed/Lost', 'Lost', 'Sold', 'Already Rented'))
         """)
@@ -2920,7 +2920,7 @@ def get_smart_matches(current_user: dict = Depends(get_current_user), limit: int
                    building_facing, property_type, area_size, lead_type,
                    lead_status, created_by, updated_on
             FROM leads 
-            WHERE lead_type IN ('seller', 'landlord', 'builder', 'agent') 
+            WHERE lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent')
             AND lead_status NOT IN ('Sold', 'Closed/Lost', 'Lost')
             AND (is_deleted IS NULL OR is_deleted = 0)
             ORDER BY updated_on DESC
