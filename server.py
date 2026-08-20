@@ -927,6 +927,36 @@ def get_me(current_user: dict = Depends(get_current_user)):
     return UserResponse(**current_user)
 
 # ============= Lead Scoring Helper Functions =============
+def _coerce_valid_date(value: Any) -> Optional[date]:
+    """Return a real calendar date, treating legacy zero/invalid dates as missing."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    value_text = str(value).strip()
+    if not value_text or value_text.startswith('0000-00-00'):
+        return None
+    try:
+        return datetime.strptime(value_text[:10], '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid lead date while calculating score: %r", value)
+        return None
+
+
+def _coerce_float(value: Any) -> float:
+    """Convert legacy numeric values without allowing one bad row to abort a list."""
+    if value is None or value == '':
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid lead number while calculating score: %r", value)
+        return 0.0
+
+
 def calculate_lead_score(lead: dict, last_followup_date: Optional[date] = None) -> dict:
     """
     Calculate lead score based on multiple factors:
@@ -956,8 +986,9 @@ def calculate_lead_score(lead: dict, last_followup_date: Optional[date] = None) 
     
     # 2. Recency Score (0-25 points) - Based on last contact
     days_since_contact = None
-    if last_followup_date:
-        days_since_contact = (today - last_followup_date).days
+    valid_followup_date = _coerce_valid_date(last_followup_date)
+    if valid_followup_date:
+        days_since_contact = max(0, (today - valid_followup_date).days)
         if days_since_contact <= 2:
             score += 25
             breakdown.append(('Recency', 25, f'Contacted {days_since_contact}d ago'))
@@ -974,13 +1005,9 @@ def calculate_lead_score(lead: dict, last_followup_date: Optional[date] = None) 
             breakdown.append(('Recency', 0, f'No contact for {days_since_contact}d'))
     else:
         # Check created_at if no followup
-        created_at = lead.get('created_at')
-        if created_at:
-            if isinstance(created_at, str):
-                created_date = datetime.strptime(created_at[:10], '%Y-%m-%d').date()
-            else:
-                created_date = created_at.date() if hasattr(created_at, 'date') else created_at
-            days_since_created = (today - created_date).days
+        created_date = _coerce_valid_date(lead.get('created_at'))
+        if created_date:
+            days_since_created = max(0, (today - created_date).days)
             if days_since_created <= 3:
                 score += 15
                 breakdown.append(('Recency', 15, f'New lead ({days_since_created}d old)'))
@@ -990,9 +1017,8 @@ def calculate_lead_score(lead: dict, last_followup_date: Optional[date] = None) 
             breakdown.append(('Recency', 0, 'Never contacted'))
     
     # 3. Budget Score (0-20 points)
-    budget_max = lead.get('budget_max') or lead.get('budget_min') or 0
+    budget_max = _coerce_float(lead.get('budget_max') or lead.get('budget_min'))
     if budget_max:
-        budget_max = float(budget_max)
         if budget_max >= 5:  # 5 Cr+
             score += 20
             breakdown.append(('Budget', 20, f'High budget (₹{budget_max}Cr)'))
