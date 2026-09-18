@@ -824,25 +824,6 @@ class ReminderCreate(BaseModel):
     status: str = "Pending"
     priority: Optional[str] = "Medium"
 
-
-REMINDER_STATUS_MAP = {
-    'pending': 'Pending',
-    'completed': 'Completed',
-    'snoozed': 'Snoozed',
-    'missed': 'Missed',
-    'dismissed': 'Dismissed',
-    'up coming': 'Up Coming',
-    'upcoming': 'Up Coming',
-}
-
-
-def normalize_reminder_status(value: Any) -> str:
-    """Return the actions-table value for a supported reminder status."""
-    normalized = str(value or '').strip().lower()
-    if normalized not in REMINDER_STATUS_MAP:
-        raise HTTPException(status_code=400, detail="Invalid reminder status")
-    return REMINDER_STATUS_MAP[normalized]
-
 class CollaborationCommentCreate(BaseModel):
     body: str
     mention_ids: Optional[List[int]] = None
@@ -2623,7 +2604,11 @@ def create_reminder(reminder: ReminderCreate, current_user: dict = Depends(get_c
         
         # Map status to valid enum values for actions table
         # actions status: 'Pending','Completed','Snoozed','Missed','Dismissed','Up Coming'
-        status = normalize_reminder_status(reminder.status)
+        status = reminder.status
+        if status.lower() == 'pending':
+            status = 'Pending'
+        elif status.lower() == 'completed':
+            status = 'Completed'
         
         # Insert into actions table
         assigned_to = reminder.assigned_to or current_user['id']
@@ -2692,16 +2677,12 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
         
         # Map status
         if 'status' in reminder_data:
-            reminder_data['status'] = normalize_reminder_status(reminder_data['status'])
-            if reminder_data['status'] == 'Completed':
+            status = reminder_data['status']
+            if status.lower() == 'pending':
+                reminder_data['status'] = 'Pending'
+            elif status.lower() == 'completed':
+                reminder_data['status'] = 'Completed'
                 reminder_data['completed_at'] = datetime.now()
-            # "Stop Reminders" intentionally does not complete the task. It
-            # persists Dismissed as a notification-only terminal state so the
-            # existing mobile sync will not schedule another hourly sequence.
-            if reminder_data['status'] in ('Completed', 'Dismissed'):
-                reminder_data['is_notified'] = 1
-            elif reminder_data['status'] in ('Pending', 'Snoozed', 'Up Coming'):
-                reminder_data['is_notified'] = 0
         
         # Build dynamic update query
         update_fields = []
@@ -2729,7 +2710,17 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
         conn.commit()
         
         if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Action/Reminder not found")
+            # MySQL reports changed rows, not matched rows. Repeating a stop
+            # on an already-dismissed reminder is a successful no-op.
+            if current_user.get('role') == 'admin':
+                cursor.execute("SELECT id FROM actions WHERE id = %s", (reminder_id,))
+            else:
+                cursor.execute(
+                    "SELECT id FROM actions WHERE id = %s AND (user_id = %s OR assigned_to = %s)",
+                    (reminder_id, current_user['id'], current_user['id']),
+                )
+            if not cursor.fetchone():
+                raise HTTPException(status_code=404, detail="Action/Reminder not found")
         
         cursor.execute(
             """SELECT a.*, l.name as lead_name, l.phone as lead_phone,
