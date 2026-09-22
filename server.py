@@ -749,6 +749,7 @@ class LeadResponse(BaseModel):
     detail_access_status: Optional[str] = None
 
 class LeadCreate(BaseModel):
+    creation_context: Optional[str] = None
     name: str
     phone: Optional[str] = None
     email: Optional[str] = None
@@ -1961,6 +1962,12 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/leads", response_model=LeadResponse)
 def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)):
+    if (
+        str(lead.lead_type or '').strip().lower() in {'buyer', 'tenant'}
+        and str(current_user.get('role') or '').strip().lower() != 'admin'
+        and lead.creation_context != 'cold_calling'
+    ):
+        raise HTTPException(status_code=403, detail="Add buyers and tenants from the Cold Calling screen.")
     with get_db() as conn:
         cursor = conn.cursor()
         floor_pricing = getattr(lead, 'floor_pricing', None) or []
