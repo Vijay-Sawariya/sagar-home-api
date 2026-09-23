@@ -5798,14 +5798,27 @@ def get_team_members(current_user: dict = Depends(get_current_user)):
         members = cursor.fetchall()
         return [dict(m) for m in members]
 
+def active_assignment_user_condition(cursor):
+    """Match the web app's active, non-deleted user selection on legacy schemas."""
+    columns = _table_columns(cursor, 'users')
+    conditions = ['id <> 9']
+    if 'is_active' in columns:
+        conditions.append('is_active = 1')
+    if 'is_deleted' in columns:
+        conditions.append('(is_deleted IS NULL OR is_deleted != 1)')
+    return ' AND '.join(conditions)
+
+
 @api_router.get("/users/assignable")
 def get_assignable_users(current_user: dict = Depends(get_current_user)):
-    """Get users available for reminder assignment."""
+    """Get active users available for lead and reminder assignment."""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute("""
+        condition = active_assignment_user_condition(cursor)
+        cursor.execute(f"""
             SELECT id, username, full_name, email, role
             FROM users
+            WHERE {condition}
             ORDER BY COALESCE(NULLIF(full_name, ''), username)
         """)
         users = []
@@ -5825,9 +5838,10 @@ def assign_lead_to_member(lead_id: int, user_id: int, current_user: dict = Depen
         cursor = conn.cursor()
         ensure_collaboration_tables(cursor)
         try:
-            cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            condition = active_assignment_user_condition(cursor)
+            cursor.execute(f"SELECT id FROM users WHERE id = %s AND {condition}", (user_id,))
             if not cursor.fetchone():
-                raise HTTPException(status_code=404, detail="Team member not found")
+                raise HTTPException(status_code=404, detail="Active team member not found")
             cursor.execute("SELECT id FROM leads WHERE id = %s", (lead_id,))
             if not cursor.fetchone():
                 raise HTTPException(status_code=404, detail="Lead not found")
