@@ -4324,6 +4324,11 @@ def _pick_column(columns: set, candidates: List[str]) -> Optional[str]:
 
 def _lead_summary(row: dict, user_role: str, user_id: int) -> dict:
     lead = apply_lead_masking(dict(row), user_role, user_id)
+    created_at = lead.get('created_at')
+    if isinstance(created_at, (datetime, date)):
+        created_at = created_at.isoformat()
+    elif created_at:
+        created_at = str(created_at)
     return {
         "id": lead.get("id"),
         "name": lead.get("name"),
@@ -4345,7 +4350,7 @@ def _lead_summary(row: dict, user_role: str, user_id: int) -> dict:
         "current_assignee_id": lead.get("current_assignee_id"),
         "assigned_to_name": lead.get("assigned_to_name"),
         "can_view_sensitive": lead.get("can_view_sensitive"),
-        "created_at": lead.get("created_at").isoformat() if lead.get("created_at") else None,
+        "created_at": created_at or None,
     }
 
 def _build_whatsapp_intelligence(row: dict) -> dict:
@@ -4838,52 +4843,56 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
 
 @api_router.get("/mobile/assigned-leads")
 def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), limit: int = 100):
-    """Leads assigned to the current user, with admin able to see all assigned leads."""
-    user_role = current_user.get('role', '')
+    """Read assignments from either web or mobile schemas without requiring DDL access."""
+    user_role = (current_user.get('role') or '').strip().lower()
     user_id = current_user.get('id')
     safe_limit = max(1, min(limit, 500))
     with get_db() as conn:
         cursor = conn.cursor()
-        ensure_collaboration_tables(cursor)
-        conn.commit()
+        lead_columns = _table_columns(cursor, 'leads')
         assignment_columns = _table_columns(cursor, 'lead_assignments')
-        assignment_order = "la.assigned_at DESC"
-        if 'id' in assignment_columns:
-            assignment_order += ", la.id DESC"
-        where = (
-            "(l.assigned_to IS NOT NULL OR EXISTS (SELECT 1 FROM lead_assignments la WHERE la.lead_id = l.id))"
-            if user_role == 'admin'
-            else """(
-                l.assigned_to = %s OR EXISTS (
-                    SELECT 1 FROM lead_assignments la
-                    WHERE la.lead_id = l.id AND la.user_id = %s
-                )
-            )"""
-        )
-        params: List[Any] = [] if user_role == 'admin' else [user_id]
+        has_assignments = {'lead_id', 'user_id'}.issubset(assignment_columns)
+        has_legacy_owner = 'assigned_to' in lead_columns
+        if not has_assignments and not has_legacy_owner:
+            return []
+
+        owner_sources = []
+        if has_assignments:
+            order = [f"la.{column} DESC" for column in ('assigned_at', 'id', 'user_id') if column in assignment_columns]
+            owner_sources.append(f"""(
+                SELECT la.user_id FROM lead_assignments la
+                WHERE la.lead_id = l.id
+                ORDER BY {', '.join(order)} LIMIT 1
+            )""")
+        if has_legacy_owner:
+            owner_sources.append('NULLIF(l.assigned_to, 0)')
+        owner = f"COALESCE({', '.join(owner_sources)})" if len(owner_sources) > 1 else owner_sources[0]
+        filters = [f"{owner} IS NOT NULL"] if user_role == 'admin' else []
+        params: List[Any] = []
         if user_role != 'admin':
-            params.append(user_id)
+            membership = []
+            if has_legacy_owner:
+                membership.append('l.assigned_to = %s')
+                params.append(user_id)
+            if has_assignments:
+                membership.append('EXISTS (SELECT 1 FROM lead_assignments mine WHERE mine.lead_id = l.id AND mine.user_id = %s)')
+                params.append(user_id)
+            filters.append(f"({' OR '.join(membership)})")
+        if 'is_deleted' in lead_columns:
+            filters.append('(l.is_deleted IS NULL OR l.is_deleted = 0)')
         params.append(safe_limit)
         cursor.execute(f"""
             SELECT l.*, u.full_name as created_by_name,
-                   COALESCE(latest_assignee.full_name, assignee.full_name) as assigned_to_name
+                   {owner} as current_assignee_id,
+                   COALESCE(NULLIF(assignee.full_name, ''), assignee.username) as assigned_to_name
             FROM leads l
             LEFT JOIN users u ON u.id = l.created_by
-            LEFT JOIN users assignee ON assignee.id = l.assigned_to
-            LEFT JOIN users latest_assignee ON latest_assignee.id = (
-                SELECT la.user_id FROM lead_assignments la
-                WHERE la.lead_id = l.id
-                ORDER BY {assignment_order}
-                LIMIT 1
-            )
-            WHERE {where}
-              AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-            ORDER BY l.created_at DESC
+            LEFT JOIN users assignee ON assignee.id = {owner}
+            WHERE {' AND '.join(filters)}
+            ORDER BY l.created_at DESC, l.id DESC
             LIMIT %s
         """, params)
-        rows = cursor.fetchall()
-        attach_current_assignees(cursor, rows)
-        return [_lead_summary(row, user_role, user_id) for row in rows]
+        return [_lead_summary(row, user_role, user_id) for row in cursor.fetchall()]
 
 @api_router.get("/mobile/enquiries")
 def get_mobile_enquiries(
