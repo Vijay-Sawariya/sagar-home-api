@@ -98,7 +98,7 @@ def apply_lead_masking(
         or lead.get('assigned_user_id')
     )
     can_view_sensitive = (
-        not should_mask_data(user_role, user_id, created_by, assigned_to)
+        not should_mask_data(user_role, user_id, created_by, assigned_to if lead.get('assignment_can_view_private') in (True, 1, '1') else None)
         or detail_access_status == 'approved'
     )
     lead['can_view_sensitive'] = can_view_sensitive
@@ -157,10 +157,38 @@ def current_assignee_map(cursor, lead_ids: List[int]) -> Dict[int, Optional[int]
             result.setdefault(int(row['id']), row.get('assigned_to'))
     return result
 
+def assignment_contact_map(cursor, lead_ids: List[int], owners=None) -> Dict[int, Optional[int]]:
+    """Only an explicit grant on the current assignment unlocks contact data."""
+    if owners is None:
+        owners = current_assignee_map(cursor, lead_ids)
+    if not owners or 'can_view_private' not in _table_columns(cursor, 'lead_assignments'):
+        return {}
+    placeholders = ','.join(['%s'] * len(owners))
+    cursor.execute(f"""
+        SELECT lead_id, user_id, can_view_private FROM lead_assignments
+        WHERE lead_id IN ({placeholders})
+    """, list(owners))
+    return {int(row['lead_id']): row['user_id'] for row in cursor.fetchall()
+            if row.get('can_view_private') in (True, 1, '1')
+            and owners.get(int(row['lead_id'])) == row['user_id']}
+
+
 def attach_current_assignees(cursor, leads: List[dict]) -> List[dict]:
-    assignment_map = current_assignee_map(cursor, [lead.get('id') for lead in leads if lead.get('id')])
+    lead_ids = [lead['id'] for lead in leads if lead.get('id')]
+    assignment_map = current_assignee_map(cursor, lead_ids)
+    contact_map = assignment_contact_map(cursor, lead_ids, assignment_map)
+    user_ids = sorted({owner for owner in assignment_map.values() if owner})
+    names = {}
+    if user_ids:
+        placeholders = ','.join(['%s'] * len(user_ids))
+        cursor.execute(f"SELECT id, username, full_name FROM users WHERE id IN ({placeholders})", user_ids)
+        names = {row['id']: row for row in cursor.fetchall()}
     for lead in leads:
-        lead['current_assignee_id'] = assignment_map.get(int(lead['id'])) if lead.get('id') else None
+        owner = assignment_map.get(int(lead['id'])) if lead.get('id') else None
+        lead['current_assignee_id'] = owner
+        lead['assignment_can_view_private'] = bool(owner and contact_map.get(int(lead['id'])) == owner)
+        lead['assigned_to_username'] = names.get(owner, {}).get('username')
+        lead['assigned_to_name'] = names.get(owner, {}).get('full_name') or lead['assigned_to_username']
     return leads
 
 # MySQL connection config
@@ -1921,7 +1949,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
                 ORDER BY pl.created_at DESC
             """, (lead_id,))
             matched_properties = cursor.fetchall()
-            property_assignment_map = current_assignee_map(
+            property_assignment_map = assignment_contact_map(
                 cursor,
                 [prop.get('property_id') for prop in matched_properties if prop.get('property_id')]
             )
@@ -1945,7 +1973,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
                     current_user.get('role', ''),
                     current_user.get('id'),
                     prop.get('property_created_by'),
-                    prop.get('property_current_assignee_id') or prop.get('property_assigned_to'),
+                    prop.get('property_current_assignee_id'),
                 ):
                     prop['can_view_sensitive'] = False
                     if prop.get('property_phone'):
@@ -2142,7 +2170,10 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         
         cursor.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
         updated = cursor.fetchone()
-    
+        if updated:
+            attach_current_assignees(cursor, [updated])
+            access = get_detail_access_map(cursor, current_user['id'], [lead_id])
+            updated = apply_lead_masking(updated, current_user.get('role', ''), current_user['id'], access.get(lead_id))
     return updated
 
 @api_router.delete("/leads/{lead_id}")
@@ -2499,7 +2530,7 @@ def get_whatsapp_logs(lead_id: Optional[int] = None, limit: int = 100, current_u
         """, [*params, safe_limit])
         logs = cursor.fetchall()
         lead_ids = [row.get('lead_id') for row in logs if row.get('lead_id')]
-        assignment_map = current_assignee_map(cursor, lead_ids)
+        assignment_map = assignment_contact_map(cursor, lead_ids)
         creator_map: Dict[int, Optional[int]] = {}
         if lead_ids:
             clean_ids = sorted({int(item) for item in lead_ids})
@@ -2549,7 +2580,7 @@ def get_reminders(
             (current_user['id'], current_user['id'], limit, skip)
         )
         actions = cursor.fetchall()
-        assignment_map = current_assignee_map(
+        assignment_map = assignment_contact_map(
             cursor,
             [action.get('lead_id') for action in actions if action.get('lead_id')]
         )
@@ -2634,7 +2665,7 @@ def create_reminder(reminder: ReminderCreate, current_user: dict = Depends(get_c
         action_id = cursor.lastrowid
         
         cursor.execute(
-            """SELECT a.*, l.name as lead_name, l.phone as lead_phone,
+            """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
                       creator.full_name as created_by_name, creator.username as created_by_username,
                       assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
                FROM actions a
@@ -2649,6 +2680,10 @@ def create_reminder(reminder: ReminderCreate, current_user: dict = Depends(get_c
         # Format response for frontend
         if created:
             created = dict(created)
+            if created.get('lead_phone'):
+                grants = assignment_contact_map(cursor, [created['lead_id']])
+                if should_mask_data(current_user.get('role', ''), current_user['id'], created.get('lead_created_by'), grants.get(created['lead_id'])):
+                    created['lead_phone'] = mask_phone(created['lead_phone'])
             if created.get('due_date'):
                 date_str = str(created['due_date'])
                 time_str = str(created.get('due_time', '00:00:00') or '00:00:00')
@@ -2735,7 +2770,7 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
                 raise HTTPException(status_code=404, detail="Action/Reminder not found")
         
         cursor.execute(
-            """SELECT a.*, l.name as lead_name, l.phone as lead_phone,
+            """SELECT a.*, l.name as lead_name, l.phone as lead_phone, l.created_by as lead_created_by,
                       creator.full_name as created_by_name, creator.username as created_by_username,
                       assignee.full_name as assigned_to_name, assignee.username as assigned_to_username
                FROM actions a
@@ -2750,6 +2785,10 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
         # Format response
         if updated:
             updated = dict(updated)
+            if updated.get('lead_phone'):
+                grants = assignment_contact_map(cursor, [updated['lead_id']])
+                if should_mask_data(current_user.get('role', ''), current_user['id'], updated.get('lead_created_by'), grants.get(updated['lead_id'])):
+                    updated['lead_phone'] = mask_phone(updated['lead_phone'])
             if updated.get('due_date'):
                 date_str = str(updated['due_date'])
                 time_str = str(updated.get('due_time', '00:00:00') or '00:00:00')
@@ -3111,7 +3150,7 @@ def get_urgent_followups(current_user: dict = Depends(get_current_user), limit: 
         """, (limit,))
         
         followups = cursor.fetchall()
-        assignment_map = current_assignee_map(
+        assignment_map = assignment_contact_map(
             cursor,
             [item.get('lead_id') for item in followups if item.get('lead_id')]
         )
@@ -3746,7 +3785,7 @@ def get_site_visits(current_user: dict = Depends(get_current_user), status: Opti
             query += " ORDER BY sv.visit_date ASC, sv.visit_time ASC, COALESCE(sv.visit_order, 999) ASC"
             cursor.execute(query, params)
             visits = cursor.fetchall()
-            assignment_map = current_assignee_map(
+            assignment_map = assignment_contact_map(
                 cursor,
                 [visit.get('lead_id') for visit in visits if visit.get('lead_id')]
             )
@@ -3936,7 +3975,7 @@ def get_deals(current_user: dict = Depends(get_current_user), status: Optional[s
             query += " ORDER BY d.created_at DESC"
             cursor.execute(query, params)
             deals = cursor.fetchall()
-            assignment_map = current_assignee_map(
+            assignment_map = assignment_contact_map(
                 cursor,
                 [deal.get('lead_id') for deal in deals if deal.get('lead_id')]
             )
@@ -4019,7 +4058,7 @@ def get_lead_activity(lead_id: int, current_user: dict = Depends(get_current_use
         cursor = conn.cursor()
         cursor.execute("SELECT created_by FROM leads WHERE id = %s", (lead_id,))
         lead_owner = cursor.fetchone() or {}
-        assignment_map = current_assignee_map(cursor, [lead_id])
+        assignment_map = assignment_contact_map(cursor, [lead_id])
         can_view_sensitive = not should_mask_data(
             current_user.get('role', ''),
             current_user.get('id'),
@@ -4349,6 +4388,8 @@ def _lead_summary(row: dict, user_role: str, user_id: int) -> dict:
         "assigned_to": lead.get("assigned_to"),
         "current_assignee_id": lead.get("current_assignee_id"),
         "assigned_to_name": lead.get("assigned_to_name"),
+        "assigned_to_username": lead.get("assigned_to_username"),
+        "assignment_can_view_private": lead.get("assignment_can_view_private", False),
         "can_view_sensitive": lead.get("can_view_sensitive"),
         "created_at": created_at or None,
     }
@@ -4686,7 +4727,7 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
 
     def normalize_action_rows(rows):
         normalized = []
-        assignment_map = current_assignee_map(
+        assignment_map = assignment_contact_map(
             cursor,
             [row.get('lead_id') for row in rows if row.get('lead_id')]
         )
@@ -4892,7 +4933,9 @@ def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), li
             ORDER BY l.created_at DESC, l.id DESC
             LIMIT %s
         """, params)
-        return [_lead_summary(row, user_role, user_id) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+        attach_current_assignees(cursor, rows)
+        return [_lead_summary(row, user_role, user_id) for row in rows]
 
 @api_router.get("/mobile/enquiries")
 def get_mobile_enquiries(
@@ -5142,7 +5185,7 @@ def request_lead_detail_access(lead_id: int, current_user: dict = Depends(get_cu
             existing_status = existing_map.get(lead_id)
             if not should_mask_data(
                 current_user.get('role', ''), current_user['id'], creator_id,
-                lead.get('current_assignee_id') or lead.get('assigned_to')
+                lead.get('current_assignee_id') if lead.get('assignment_can_view_private') else None
             ) or existing_status == 'approved':
                 if existing_status == 'approved':
                     cursor.execute("SELECT id FROM lead_detail_access_requests WHERE lead_id=%s AND requester_id=%s", (lead_id, current_user['id']))
@@ -5838,7 +5881,7 @@ def get_assignable_users(current_user: dict = Depends(get_current_user)):
         return users
 
 @api_router.post("/team/assign-lead")
-def assign_lead_to_member(lead_id: int, user_id: int, current_user: dict = Depends(get_current_user)):
+def assign_lead_to_member(lead_id: int, user_id: int, current_user: dict = Depends(get_current_user), can_view_private: bool = False):
     """Assign a lead to a team member"""
     if current_user['role'] != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
@@ -5846,6 +5889,8 @@ def assign_lead_to_member(lead_id: int, user_id: int, current_user: dict = Depen
     with get_db() as conn:
         cursor = conn.cursor()
         ensure_collaboration_tables(cursor)
+        if 'can_view_private' not in _table_columns(cursor, 'lead_assignments'):
+            cursor.execute("ALTER TABLE lead_assignments ADD COLUMN can_view_private TINYINT(1) NOT NULL DEFAULT 0")
         try:
             condition = active_assignment_user_condition(cursor)
             cursor.execute(f"SELECT id FROM users WHERE id = %s AND {condition}", (user_id,))
@@ -5856,9 +5901,9 @@ def assign_lead_to_member(lead_id: int, user_id: int, current_user: dict = Depen
                 raise HTTPException(status_code=404, detail="Lead not found")
             cursor.execute("DELETE FROM lead_assignments WHERE lead_id = %s", (lead_id,))
             cursor.execute("""
-                INSERT INTO lead_assignments (lead_id, user_id, assigned_by)
-                VALUES (%s, %s, %s)
-            """, (lead_id, user_id, current_user['id']))
+                INSERT INTO lead_assignments (lead_id, user_id, assigned_by, can_view_private)
+                VALUES (%s, %s, %s, %s)
+            """, (lead_id, user_id, current_user['id'], int(can_view_private)))
             cursor.execute("UPDATE leads SET assigned_to = %s WHERE id = %s", (user_id, lead_id))
             conn.commit()
             return {"message": "Lead assigned successfully"}
