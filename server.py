@@ -101,13 +101,16 @@ def apply_lead_masking(
         not should_mask_data(user_role, user_id, created_by, assigned_to if lead.get('assignment_can_view_private') in (True, 1, '1') else None)
         or detail_access_status == 'approved'
     )
+    # An unchecked assignment is an explicit restriction for its recipient.
+    if assigned_to and int(assigned_to) == int(user_id or 0) and lead.get('assignment_can_view_private') not in (True, 1, '1'):
+        can_view_sensitive = False
     lead['can_view_sensitive'] = can_view_sensitive
     lead['detail_access_status'] = detail_access_status
     if not can_view_sensitive:
         if lead.get('phone'):
             lead['phone'] = mask_phone(lead['phone'])
         if lead.get('address'):
-            lead['address'] = mask_address(lead['address'])
+            lead['address'] = '**********'
         if lead.get('email'):
             lead['email'] = None
         if 'Property_locationUrl' in lead:
