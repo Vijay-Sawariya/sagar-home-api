@@ -1957,20 +1957,11 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
                 [prop.get('property_id') for prop in matched_properties if prop.get('property_id')]
             )
             
-            # Fetch floor pricing for each matched property
+            pricing_map = _get_floor_pricing_map(
+                cursor, [prop['property_id'] for prop in matched_properties if prop.get('property_id')]
+            )
             for prop in matched_properties:
-                if prop.get('property_id'):
-                    cursor.execute(
-                        "SELECT floor_label, floor_amount FROM inventory_floor_pricing WHERE lead_id = %s ORDER BY id",
-                        (prop['property_id'],)
-                    )
-                    prop_floor_pricing = cursor.fetchall()
-                    prop['floor_pricing'] = [
-                        {'floor_label': fp['floor_label'], 'floor_amount': float(fp['floor_amount']) if fp['floor_amount'] else 0}
-                        for fp in prop_floor_pricing
-                    ]
-                else:
-                    prop['floor_pricing'] = []
+                prop['floor_pricing'] = pricing_map.get(prop.get('property_id'), [])
                 prop['property_current_assignee_id'] = property_assignment_map.get(prop.get('property_id'))
                 if should_mask_data(
                     current_user.get('role', ''),
