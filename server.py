@@ -19,6 +19,7 @@ import asyncio
 import json
 import csv
 import io
+import inventory_updates
 
 # Import for AI features
 try:
@@ -1864,6 +1865,9 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
         if not lead:
             raise HTTPException(status_code=404, detail="Lead not found")
         
+        if not can_access_collaboration_lead(cursor, lead_id, current_user):
+            raise HTTPException(403, 'Full lead access requires ownership, assignment or collaboration access.')
+
         # Fetch floor pricing from database
         cursor.execute(
             "SELECT floor_label, floor_amount FROM inventory_floor_pricing WHERE lead_id = %s ORDER BY id",
@@ -2082,6 +2086,146 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
         created = cursor.fetchone()
     
     return LeadResponse(**created)
+
+def ensure_inventory_reports(cursor):
+    cursor.execute("""CREATE TABLE IF NOT EXISTS inventory_change_reports (
+        id INT AUTO_INCREMENT PRIMARY KEY, lead_id INT NOT NULL, requester_id INT NOT NULL,
+        change_type VARCHAR(30) NOT NULL, floor_label VARCHAR(100) NOT NULL DEFAULT '',
+        proposed_amount DECIMAL(15,2) NULL, call_notes TEXT NOT NULL, original_values LONGTEXT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending', reviewer_id INT NULL, review_notes TEXT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, reviewed_at DATETIME NULL,
+        INDEX lead_status (lead_id,status)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+
+
+def inventory_snapshot(cursor, lead):
+    cursor.execute('SELECT floor_label, floor_amount FROM inventory_floor_pricing WHERE lead_id=%s ORDER BY floor_label, floor_amount FOR UPDATE', (lead['id'],))
+    return {**{key: lead.get(key) for key in ('lead_status', 'unit', 'budget_min', 'budget_max')},
+            'floor': lead.get('floor') or '', 'prices': list(cursor.fetchall())}
+
+
+def inventory_permission(cursor, lead, user):
+    assignee = current_assignee_map(cursor, [lead['id']]).get(lead['id'])
+    full = not should_mask_data(str(user.get('role', '')).strip().lower(), user['id'], lead.get('created_by'), assignee)
+    # Lock the approval row so a concurrent revocation cannot race this write.
+    cursor.execute('SELECT status FROM lead_detail_access_requests WHERE lead_id=%s AND requester_id=%s FOR UPDATE', (lead['id'], user['id']))
+    request = cursor.fetchone()
+    full = full or bool(request and request['status'] == 'approved')
+    status_only = str(user.get('role', '')).strip().lower() == 'sr agent' and str(lead.get('lead_type', '')).strip().lower() == 'builder'
+    if not full and not status_only:
+        raise HTTPException(403, 'You do not have permission to update this inventory.')
+    return full
+
+
+def lock_inventory(cursor, lead_id):
+    cursor.execute('SELECT * FROM leads WHERE id=%s AND (is_deleted IS NULL OR is_deleted=0) FOR UPDATE', (lead_id,))
+    lead = cursor.fetchone()
+    if not lead or str(lead.get('lead_type', '')).strip().lower() not in {'seller', 'builder', 'landlord', 'owner', 'agent'}:
+        raise HTTPException(404, 'Inventory unavailable.')
+    return lead
+
+
+@api_router.get('/leads/{lead_id}/inventory-update')
+def get_inventory_update(lead_id: int, current_user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_collaboration_tables(cursor)
+        conn.commit()
+        conn.begin()
+        try:
+            lead = lock_inventory(cursor, lead_id)
+            full = inventory_permission(cursor, lead, current_user)
+            snapshot = inventory_snapshot(cursor, lead)
+            result = dict(floors=inventory_updates.floors(snapshot), prices=snapshot['prices'],
+                          property_price=snapshot['budget_max'], unit=snapshot['unit'] or 'Cr',
+                          entire_sold=snapshot['lead_status'] == 'Sold', can_edit_prices=full,
+                          inventory_version=inventory_updates.version(snapshot))
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
+
+
+@api_router.put('/leads/{lead_id}/inventory-update')
+def save_inventory_update(lead_id: int, data: dict, current_user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_collaboration_tables(cursor)
+        ensure_inventory_reports(cursor)
+        conn.commit()  # DDL must never run inside the mutation transaction.
+        conn.begin()
+        try:
+            lead = lock_inventory(cursor, lead_id)
+            full = inventory_permission(cursor, lead, current_user)
+            before = inventory_snapshot(cursor, lead)
+            if data.get('inventory_version') != inventory_updates.version(before):
+                raise HTTPException(409, 'Inventory changed. Close and reopen this popup to verify the latest values.')
+            try:
+                changes = inventory_updates.plan(before, data)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
+            if not full and any(change[0].startswith('price_') for change in changes):
+                raise HTTPException(403, 'Sr Agents can change builder availability only; price changes require inventory access.')
+            for kind, label, amount in changes:
+                snapshot = inventory_snapshot(cursor, lead)
+                cursor.execute("""INSERT INTO inventory_change_reports
+                    (lead_id,requester_id,change_type,floor_label,proposed_amount,call_notes,original_values,
+                     status,reviewer_id,review_notes,reviewed_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'applied',%s,'Updated directly with inventory access',NOW())""",
+                    (lead_id,current_user['id'],kind,label,amount,data['call_notes'].strip(),json.dumps(snapshot, default=str),current_user['id']))
+                report_id = cursor.lastrowid
+                if kind == 'sold_all':
+                    cursor.execute('DELETE FROM inventory_floor_pricing WHERE lead_id=%s', (lead_id,))
+                    lead.update(floor='', lead_status='Sold', budget_min=None, budget_max=None)
+                elif kind == 'sold_floor':
+                    remaining = [f for f in inventory_updates.floors(snapshot) if f != label]
+                    cursor.execute('DELETE FROM inventory_floor_pricing WHERE lead_id=%s AND floor_label=%s', (lead_id,label))
+                    lead['floor'] = ','.join(remaining)
+                    if not remaining:
+                        lead['lead_status'] = 'Sold'
+                elif kind == 'price_floor':
+                    cursor.execute('DELETE FROM inventory_floor_pricing WHERE lead_id=%s AND floor_label=%s', (lead_id,label))
+                    cursor.execute('INSERT INTO inventory_floor_pricing (lead_id,floor_label,floor_amount) VALUES (%s,%s,%s)', (lead_id,label,amount))
+                else:
+                    lead.update(budget_min=amount, budget_max=amount)
+                if kind in {'sold_floor', 'price_floor'}:
+                    cursor.execute('SELECT MIN(floor_amount) low, MAX(floor_amount) high FROM inventory_floor_pricing WHERE lead_id=%s', (lead_id,))
+                    limits = cursor.fetchone()
+                    lead.update(budget_min=limits['low'], budget_max=limits['high'])
+                cursor.execute('UPDATE leads SET floor=%s,lead_status=%s,budget_min=%s,budget_max=%s WHERE id=%s',
+                               (lead.get('floor'),lead['lead_status'],lead['budget_min'],lead['budget_max'],lead_id))
+            if changes:
+                cursor.execute("SELECT id FROM users WHERE LOWER(TRIM(role))='admin' OR id=%s", (lead['created_by'],))
+                recipients = cursor.fetchall()
+                for recipient in recipients:
+                    if recipient['id'] != current_user['id']:
+                        cursor.execute("""INSERT INTO collaboration_notifications
+                            (user_id,lead_id,notification_type,reference_id,message)
+                            VALUES (%s,%s,'inventory_change',%s,%s)""", (recipient['id'],lead_id,report_id,
+                            'Inventory prices / availability updated after call verification.'))
+            conn.commit()
+            return {'success': True, 'message': 'Inventory changes saved.' if changes else 'No inventory changes to save.'}
+        except Exception:
+            conn.rollback()
+            raise
+
+
+@api_router.get('/collaboration/inbox/summary')
+def get_inbox_summary(current_user: dict = Depends(get_current_user)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_collaboration_tables(cursor)
+        conn.commit()
+        cursor.execute("""SELECT
+          (SELECT COUNT(*) FROM lead_detail_access_requests r JOIN leads l ON l.id=r.lead_id
+           WHERE (l.is_deleted IS NULL OR l.is_deleted=0) AND r.creator_id=%s AND r.requester_id>0 AND r.status='pending'
+           AND EXISTS (SELECT 1 FROM collaboration_notifications n WHERE n.user_id=r.creator_id
+             AND n.reference_id=r.id AND n.notification_type='detail_access_request')) pending_requests,
+          (SELECT COUNT(*) FROM collaboration_notifications n WHERE n.user_id=%s AND n.is_read=0
+           AND n.notification_type NOT IN ('detail_access_request','detail_access_sent','inbox_deleted')) unread_updates
+        """, (current_user['id'],current_user['id']))
+        return cursor.fetchone()
+
 
 @api_router.put("/leads/{lead_id}")
 def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_current_user)):
@@ -5146,7 +5290,8 @@ def get_collaboration_inbox(limit: int = 80, current_user: dict = Depends(get_cu
             LEFT JOIN lead_detail_access_requests dar
               ON n.notification_type = 'detail_access_request' AND dar.id = n.reference_id
             WHERE n.user_id = %s
-            ORDER BY n.is_read ASC, n.created_at DESC, n.id DESC
+            ORDER BY CASE WHEN n.notification_type='detail_access_request' AND dar.status='pending' THEN 0 ELSE 1 END,
+                     n.is_read ASC, n.created_at DESC, n.id DESC
             LIMIT %s
         """, (current_user['id'], safe_limit))
         rows = [dict(row) for row in cursor.fetchall()]
