@@ -20,6 +20,7 @@ import json
 import csv
 import io
 import inventory_updates
+import schema_setup
 
 # Import for AI features
 try:
@@ -354,13 +355,18 @@ def ensure_security_audit_table(cursor):
     """)
 
 def ensure_collaboration_tables(cursor):
+    schema_setup.ensure_once('collaboration', lambda: _create_collaboration_tables(cursor))
+
+
+def _create_collaboration_tables(cursor):
     """Keep mobile collaboration compatible with the shared web LMS schema."""
     try:
         cursor.execute("SHOW COLUMNS FROM leads LIKE 'assigned_to'")
         if not cursor.fetchone():
             cursor.execute("ALTER TABLE leads ADD COLUMN assigned_to INT NULL")
     except Exception as exc:
-        logging.warning(f"Lead assignment bridge column guard skipped: {exc}")
+        logging.warning(f"Lead assignment bridge column guard failed: {exc}")
+        raise
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS lead_assignments (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -1854,6 +1860,28 @@ def export_leads(
             headers={"Content-Disposition": f'attachment; filename="{filename}"'}
         )
 
+@api_router.get('/leads/{lead_id}/edit-data')
+def get_lead_edit_data(lead_id: int, current_user: dict = Depends(get_current_user)):
+    """Fresh edit fields without detail-screen calculations, matches or history."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        ensure_collaboration_tables(cursor)
+        cursor.execute('SELECT * FROM leads WHERE id=%s AND (is_deleted IS NULL OR is_deleted=0)', (lead_id,))
+        lead = cursor.fetchone()
+        if not lead:
+            raise HTTPException(404, 'Lead not found')
+        assignee = current_assignee_map(cursor, [lead_id]).get(lead_id)
+        if should_mask_data(current_user.get('role', '').strip().lower(), current_user['id'], lead.get('created_by'), assignee):
+            raise HTTPException(403, 'Only the lead creator or current assignee can edit this lead')
+        lead['current_assignee_id'] = assignee
+        # Retain assignment privacy restrictions even when editing is allowed.
+        contact_map = assignment_contact_map(cursor, [lead_id], {lead_id: assignee}) if assignee else {}
+        lead['assignment_can_view_private'] = bool(assignee and contact_map.get(lead_id) == assignee)
+        cursor.execute('SELECT floor_label, floor_amount FROM inventory_floor_pricing WHERE lead_id=%s ORDER BY id', (lead_id,))
+        lead['floor_pricing'] = list(cursor.fetchall())
+        return apply_lead_masking(lead, current_user.get('role', ''), current_user['id'])
+
+
 @api_router.get("/leads/{lead_id}")
 def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
     with get_db() as conn:
@@ -2088,6 +2116,10 @@ def create_lead(lead: LeadCreate, current_user: dict = Depends(get_current_user)
     return LeadResponse(**created)
 
 def ensure_inventory_reports(cursor):
+    schema_setup.ensure_once('inventory_reports', lambda: _create_inventory_reports(cursor))
+
+
+def _create_inventory_reports(cursor):
     cursor.execute("""CREATE TABLE IF NOT EXISTS inventory_change_reports (
         id INT AUTO_INCREMENT PRIMARY KEY, lead_id INT NOT NULL, requester_id INT NOT NULL,
         change_type VARCHAR(30) NOT NULL, floor_label VARCHAR(100) NOT NULL DEFAULT '',
@@ -2097,17 +2129,22 @@ def ensure_inventory_reports(cursor):
         INDEX lead_status (lead_id,status)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
 
 
-def inventory_snapshot(cursor, lead):
-    cursor.execute('SELECT floor_label, floor_amount FROM inventory_floor_pricing WHERE lead_id=%s ORDER BY floor_label, floor_amount FOR UPDATE', (lead['id'],))
+def inventory_snapshot(cursor, lead, lock=True):
+    cursor.execute('SELECT floor_label, floor_amount FROM inventory_floor_pricing WHERE lead_id=%s ORDER BY floor_label, floor_amount' + (' FOR UPDATE' if lock else ''), (lead['id'],))
     return {**{key: lead.get(key) for key in ('lead_status', 'unit', 'budget_min', 'budget_max')},
             'floor': lead.get('floor') or '', 'prices': list(cursor.fetchall())}
 
 
-def inventory_permission(cursor, lead, user):
+def inventory_permission(cursor, lead, user, lock=True):
+    role = str(user.get('role', '')).strip().lower()
+    if not should_mask_data(role, user['id'], lead.get('created_by')):
+        return True
     assignee = current_assignee_map(cursor, [lead['id']]).get(lead['id'])
     full = not should_mask_data(str(user.get('role', '')).strip().lower(), user['id'], lead.get('created_by'), assignee)
+    if full:
+        return True
     # Lock the approval row so a concurrent revocation cannot race this write.
-    cursor.execute('SELECT status FROM lead_detail_access_requests WHERE lead_id=%s AND requester_id=%s FOR UPDATE', (lead['id'], user['id']))
+    cursor.execute('SELECT status FROM lead_detail_access_requests WHERE lead_id=%s AND requester_id=%s' + (' FOR UPDATE' if lock else ''), (lead['id'], user['id']))
     request = cursor.fetchone()
     full = full or bool(request and request['status'] == 'approved')
     status_only = str(user.get('role', '')).strip().lower() == 'sr agent' and str(lead.get('lead_type', '')).strip().lower() == 'builder'
@@ -2116,8 +2153,8 @@ def inventory_permission(cursor, lead, user):
     return full
 
 
-def lock_inventory(cursor, lead_id):
-    cursor.execute('SELECT * FROM leads WHERE id=%s AND (is_deleted IS NULL OR is_deleted=0) FOR UPDATE', (lead_id,))
+def lock_inventory(cursor, lead_id, lock=True):
+    cursor.execute('SELECT * FROM leads WHERE id=%s AND (is_deleted IS NULL OR is_deleted=0)' + (' FOR UPDATE' if lock else ''), (lead_id,))
     lead = cursor.fetchone()
     if not lead or str(lead.get('lead_type', '')).strip().lower() not in {'seller', 'builder', 'landlord', 'owner', 'agent'}:
         raise HTTPException(404, 'Inventory unavailable.')
@@ -2130,11 +2167,12 @@ def get_inventory_update(lead_id: int, current_user: dict = Depends(get_current_
         cursor = conn.cursor()
         ensure_collaboration_tables(cursor)
         conn.commit()
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         conn.begin()
         try:
-            lead = lock_inventory(cursor, lead_id)
-            full = inventory_permission(cursor, lead, current_user)
-            snapshot = inventory_snapshot(cursor, lead)
+            lead = lock_inventory(cursor, lead_id, lock=False)
+            full = inventory_permission(cursor, lead, current_user, lock=False)
+            snapshot = inventory_snapshot(cursor, lead, lock=False)
             result = dict(floors=inventory_updates.floors(snapshot), prices=snapshot['prices'],
                           property_price=snapshot['budget_max'], unit=snapshot['unit'] or 'Cr',
                           entire_sold=snapshot['lead_status'] == 'Sold', can_edit_prices=full,
@@ -4467,6 +4505,7 @@ def get_activity_logs(current_user: dict = Depends(get_current_user), limit: int
         return []
 
 # ============= Mobile Workbench Routes =============
+@schema_setup.cache_metadata
 def _table_exists(cursor, table_name: str) -> bool:
     cursor.execute(
         """SELECT COUNT(*) as count
@@ -4477,6 +4516,7 @@ def _table_exists(cursor, table_name: str) -> bool:
     row = cursor.fetchone()
     return bool(row and row.get('count'))
 
+@schema_setup.cache_metadata
 def _table_columns(cursor, table_name: str) -> set:
     cursor.execute(
         """SELECT COLUMN_NAME AS column_name
@@ -6232,6 +6272,22 @@ def get_property_gallery(lead_id: int, current_user: dict = Depends(get_current_
         """, (lead_id,))
         images = cursor.fetchall()
         return [dict(img) for img in images]
+
+@app.on_event('startup')
+def warm_edit_schema():
+    # Pay compatibility/setup costs before accepting form requests, once per worker.
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            ensure_collaboration_tables(cursor)
+            ensure_inventory_reports(cursor)
+            conn.commit()
+            _table_exists(cursor, 'lead_assignments')
+            _table_columns(cursor, 'lead_assignments')
+            _table_columns(cursor, 'leads')
+    except Exception:
+        logging.exception('Edit schema warmup failed; requests will retry setup')
+
 
 # Include router
 app.include_router(api_router)
