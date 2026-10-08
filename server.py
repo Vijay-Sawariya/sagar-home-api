@@ -1287,6 +1287,10 @@ def get_preferred_inventory_ids(
     inventory_ids = [row['matching_lead_id'] for row in rows]
     return {"client_id": lead_id, "preferred_inventory_ids": inventory_ids}
 
+def _is_unavailable_inventory(lead: dict) -> bool:
+    tokens = re.split(r'[,|/]', str(lead.get('lead_status') or ''))
+    return any(re.sub(r'[\s-]+', '', token.lower()) in {'sold', 'notavailable', 'unavailable'} for token in tokens)
+
 def _split_csv(value) -> List[str]:
     return [item.strip() for item in str(value or '').split(',') if item and item.strip()]
 
@@ -1440,7 +1444,7 @@ def get_matching_inventory(
               AND (l.is_deleted IS NULL OR l.is_deleted = 0)
             ORDER BY l.created_at DESC
         """, (lead_id,))
-        candidates = cursor.fetchall()
+        candidates = [row for row in cursor.fetchall() if not _is_unavailable_inventory(row)]
         attach_current_assignees(cursor, candidates)
         detail_access_map = get_detail_access_map(cursor, current_user['id'], [row['id'] for row in candidates])
         pricing_map = _get_floor_pricing_map(cursor, [row['id'] for row in candidates])
@@ -2309,7 +2313,6 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         query = f"UPDATE leads SET {', '.join(update_fields)} WHERE id = %s"
         
         cursor.execute(query, values)
-        lead_update_rowcount = cursor.rowcount
         conn.commit()
         
         # Keep the lead-level price range aligned with Web LMS floor pricing behavior.
@@ -2341,11 +2344,10 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
                     )
             conn.commit()
         
-        if lead_update_rowcount == 0:
-            raise HTTPException(status_code=404, detail="Lead not found")
-        
         cursor.execute("SELECT * FROM leads WHERE id = %s", (lead_id,))
         updated = cursor.fetchone()
+        if not updated:
+            raise HTTPException(status_code=404, detail="Lead not found")
         if updated:
             attach_current_assignees(cursor, [updated])
             access = get_detail_access_map(cursor, current_user['id'], [lead_id])
@@ -3209,7 +3211,7 @@ def get_smart_matches(current_user: dict = Depends(get_current_user), limit: int
             ORDER BY updated_on DESC
             LIMIT 100
         """)
-        inventory = cursor.fetchall()
+        inventory = [row for row in cursor.fetchall() if not _is_unavailable_inventory(row)]
         attach_current_assignees(cursor, inventory)
 
         buyer_ids = [row['id'] for row in buyers]
