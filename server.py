@@ -6292,6 +6292,9 @@ def warm_edit_schema():
 
 
 # Include router
+from monthly_inventory import register_routes as register_monthly_inventory_routes
+register_monthly_inventory_routes(api_router, get_db, get_current_user, LeadCreate)
+
 app.include_router(api_router)
 
 app.add_middleware(
