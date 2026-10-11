@@ -87,7 +87,9 @@ def conversion_data(payload, entry, user, lead_model):
                     raise ValueError()
             except (ValueError, TypeError):
                 raise HTTPException(422, 'Enter a valid non-negative ' + key + '.')
-    data['area_size'] = (str(data['area_size']) + ' ' + area_unit) if data.get('area_size') not in (None, '') else None
+    data['area_size'] = str(data['area_size']) if data.get('area_size') not in (None, '') else None
+    data['area_unit'] = area_unit
+    data['name'] = data['name'].title()
     if data['area_size'] and len(data['area_size']) > 20:
         raise HTTPException(422, 'Area size is too long.')
     prices = []
@@ -108,7 +110,7 @@ def conversion_data(payload, entry, user, lead_model):
     if data.get('budget_min') is not None and data.get('budget_max') is not None and data['budget_min'] > data['budget_max']:
         raise HTTPException(422, 'Maximum price must be at least the minimum.')
     data['source_type'] = 'Inventory'
-    data['notes'] = (data.get('notes') or '') + '\n\nMonthly inventory book: ' + str(entry['book_month'])[:7] + ' / ' + entry['category'] + ' / entry #' + str(entry['id']) + '\nOriginal book entry:\n' + (entry.get('note') or '')
+    data['notes'] = (data.get('notes') or '').strip()
     data.update(created_by=user['id'], created_at=datetime.now(timezone.utc).replace(tzinfo=None))
     return {k: v for k, v in data.items() if v is not None}, prices
 
@@ -120,8 +122,8 @@ def convert(conn, entry_id, payload, user, lead_model):
         cursor = conn.cursor()
         cursor.execute('SELECT e.*,b.book_month,b.category FROM monthly_inventory_entries e JOIN monthly_inventory_books b ON b.id=e.book_id WHERE e.id=%s FOR UPDATE', (entry_id,))
         entry = cursor.fetchone()
-        if not entry:
-            raise HTTPException(404, 'Book entry was not found.')
+        if not entry or entry.get('is_deleted'):
+            raise HTTPException(404, 'Book entry was not found or has been deleted.')
         if entry.get('converted_lead_id'):
             conn.commit()
             return {'id': entry['converted_lead_id'], 'already_converted': True}
@@ -144,6 +146,24 @@ def convert(conn, entry_id, payload, user, lead_model):
         cursor.execute('UPDATE monthly_inventory_entries SET converted_lead_id=%s,converted_at=NOW(),converted_by=%s WHERE id=%s', (lead_id, user['id'], entry_id))
         conn.commit()
         return {'id': lead_id, 'already_converted': False}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def soft_delete(conn, entry_id, user):
+    require_access(user)
+    conn.begin()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT e.identity_hash,b.category FROM monthly_inventory_entries e JOIN monthly_inventory_books b ON b.id=e.book_id WHERE e.id=%s', (entry_id,))
+        entry = cursor.fetchone()
+        if not entry:
+            raise HTTPException(404, 'Book entry was not found.')
+        # The web importer locks this same category/identity key before inserting.
+        cursor.execute('INSERT INTO monthly_inventory_exclusions (category,identity_hash,source_entry_id,deleted_by) VALUES (%s,%s,%s,%s) ON DUPLICATE KEY UPDATE identity_hash=VALUES(identity_hash)', (entry['category'], entry['identity_hash'], entry_id, user['id']))
+        cursor.execute('UPDATE monthly_inventory_entries e JOIN monthly_inventory_books b ON b.id=e.book_id SET e.is_deleted=1,e.deleted_at=NOW(),e.deleted_by=%s WHERE b.category=%s AND e.identity_hash=%s AND e.is_deleted=0', (user['id'], entry['category'], entry['identity_hash']))
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -173,7 +193,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
             raise HTTPException(422, 'Select a valid category.')
         with monthly_db() as conn:
             cursor = conn.cursor()
-            where, args = [], []
+            where, args = ['e.is_deleted=0'], []
             if month:
                 where.append("DATE_FORMAT(b.book_month,'%%Y-%%m')=%s"); args.append(month)
             if category:
@@ -202,6 +222,12 @@ def register_routes(router, get_db, get_current_user, lead_model):
             cursor.execute("SELECT DISTINCT DATE_FORMAT(book_month,'%Y-%m') AS month FROM monthly_inventory_books ORDER BY month DESC")
             return {'items': rows, 'total': total, 'page': page, 'has_more': page*40 < total,
                     'months': [m['month'] for m in cursor.fetchall()]}
+
+    @router.post('/monthly-inventory/{entry_id}/delete')
+    def delete_book(entry_id: int, user=Depends(authorized)):
+        with monthly_db() as conn:
+            soft_delete(conn, entry_id, user)
+        return {'deleted': True}
 
     @router.post('/monthly-inventory/{entry_id}/convert')
     def convert_book(entry_id: int, payload: dict = Body(...), user=Depends(authorized)):

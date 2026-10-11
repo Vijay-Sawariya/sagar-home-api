@@ -1925,13 +1925,14 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
         try:
             # Get floors from the floor column directly
             floors_str = lead.get('floor', '')
+            area_sqyd = float(lead['area_size']) * {'SQFT': 1 / 9, 'SQM': 1 / 0.83612736, 'ACRE': 4840}.get(lead.get('area_unit'), 1)
             
             # Calculate circle values
             if floors_str:
                 with get_db() as conn:
                     circle_values = calculate_circle_values(
                         lead['location'],
-                        float(lead['area_size']),
+                        area_sqyd,
                         floors_str,
                         conn
                     )
@@ -1940,7 +1941,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
                 # Calculate plot specifications
                 floors_count = len([f.strip() for f in floors_str.split(',') if f.strip()])
                 plot_specs = calculate_plot_specifications(
-                    float(lead['area_size']),
+                    area_sqyd,
                     floors_count,
                     'sq_yd'  # Default unit
                 )
