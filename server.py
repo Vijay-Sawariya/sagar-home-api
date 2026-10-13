@@ -6,7 +6,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime, timedelta, date
 from passlib.context import CryptContext
 import jwt
@@ -333,6 +333,10 @@ def get_user_mobile_feature_flag_values(cursor, user_id: int) -> Dict[str, bool]
     }
 
 def ensure_action_assignment_column(cursor):
+    for column, definition in [('notification_frequency', "VARCHAR(30) NOT NULL DEFAULT 'daily'"), ('notification_last_at', 'DATETIME NULL'), ('assigned_notification_last_at', 'DATETIME NULL')]:
+        cursor.execute("SHOW COLUMNS FROM actions LIKE %s", (column,))
+        if not cursor.fetchone():
+            cursor.execute(f"ALTER TABLE actions ADD COLUMN {column} {definition}")
     try:
         cursor.execute("ALTER TABLE actions ADD COLUMN assigned_to INT NULL")
     except Exception:
@@ -854,6 +858,7 @@ class ReminderResponse(BaseModel):
     created_at: Optional[datetime]
 
 class ReminderCreate(BaseModel):
+    notification_frequency: Literal['daily', 'five_minutes_before', 'hourly', 'four_hourly', 'twice_daily', 'off'] = 'daily'
     lead_id: Optional[int] = None
     title: str
     reminder_date: str  # ISO format datetime string (YYYY-MM-DDTHH:MM:SS)
@@ -2835,10 +2840,10 @@ def create_reminder(reminder: ReminderCreate, current_user: dict = Depends(get_c
         # Insert into actions table
         assigned_to = reminder.assigned_to or current_user['id']
         cursor.execute(
-            """INSERT INTO actions (user_id, assigned_to, lead_id, title, description, action_type, due_date, due_time, status, priority, is_notified)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            """INSERT INTO actions (user_id, assigned_to, lead_id, title, description, action_type, due_date, due_time, status, priority, is_notified, notification_frequency)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (current_user['id'], assigned_to, reminder.lead_id, reminder.title, reminder.notes,
-             reminder.reminder_type, date_part, time_part, status, reminder.priority or 'Medium', 0)
+             reminder.reminder_type, date_part, time_part, status, reminder.priority or 'Medium', 0, reminder.notification_frequency)
         )
         conn.commit()
         action_id = cursor.lastrowid
@@ -2910,11 +2915,16 @@ def update_reminder(reminder_id: int, reminder_data: dict, current_user: dict = 
                 reminder_data['status'] = 'Completed'
                 reminder_data['completed_at'] = datetime.now()
         
+        if 'notification_frequency' in reminder_data and reminder_data['notification_frequency'] not in ['daily', 'five_minutes_before', 'hourly', 'four_hourly', 'twice_daily', 'off']:
+            raise HTTPException(status_code=400, detail="Choose a valid notification frequency")
+        if any(field in reminder_data for field in ['due_date', 'due_time', 'notification_frequency', 'assigned_to']):
+            reminder_data['notification_last_at'] = None
+            reminder_data['assigned_notification_last_at'] = None
         # Build dynamic update query
         update_fields = []
         values = []
         
-        allowed_fields = ['title', 'due_date', 'due_time', 'action_type', 'description', 'status', 'lead_id', 'assigned_to', 'priority', 'outcome', 'completed_at', 'is_notified']
+        allowed_fields = ['title', 'due_date', 'due_time', 'action_type', 'description', 'status', 'lead_id', 'assigned_to', 'priority', 'outcome', 'completed_at', 'is_notified', 'notification_frequency', 'notification_last_at', 'assigned_notification_last_at']
         
         for field in allowed_fields:
             if field in reminder_data:
