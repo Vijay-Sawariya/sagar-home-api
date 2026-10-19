@@ -273,6 +273,7 @@ APP_FEATURE_FLAGS = {
     "followups": "Reminders",
     "daily_workbench": "Workbench",
     "legacy_inventory": "Legacy Inventory",
+    "enquiry_management": "Enquiry Management",
     "assigned_leads": "Assigned Leads",
     "team_inbox": "Team Inbox",
     "agent_performance": "Performance",
@@ -6305,6 +6306,10 @@ def warm_edit_schema():
 # Include router
 from monthly_inventory import register_routes as register_monthly_inventory_routes
 register_monthly_inventory_routes(api_router, get_db, get_current_user, LeadCreate)
+
+from enquiry_management import register_routes as register_enquiry_management_routes
+register_enquiry_management_routes(api_router, get_db, get_current_user, _table_columns,
+                                   _table_exists, active_assignment_user_condition)
 
 app.include_router(api_router)
 
