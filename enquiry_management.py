@@ -226,6 +226,22 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                 for key in ('current', 'qualification', 'source_changed'):
                     item.pop(key, None)
                 items.append(item)
+            # One query for the visible page, never one follow-up query per card.
+            by_id = {int(item['id']): item for item in items}
+            for item in items:
+                item.update(next_followup=None, followup_count=0)
+            if by_id:
+                marks = ','.join(['%s'] * len(by_id))
+                c.execute(f"""SELECT id,entity_id,due_date,due_time,status,description FROM actions
+                 WHERE entity_type='sheet_enquiry' AND entity_id IN ({marks})
+                 ORDER BY CASE WHEN status IN ('Pending','Missed') THEN 0 ELSE 1 END,
+                  CASE WHEN status IN ('Pending','Missed') THEN due_date END ASC,
+                  CASE WHEN status IN ('Pending','Missed') THEN due_time END ASC,id DESC""", list(by_id))
+                for followup in c.fetchall():
+                    item = by_id[int(followup['entity_id'])]
+                    item['followup_count'] += 1
+                    if item['next_followup'] is None:
+                        item['next_followup'] = wire(followup)
             return {'items': items, 'stats': stats, 'total': total, 'page': page, 'pages': pages,
                     'users': employees(c, user), 'can_assign': manager(user), 'can_convert': can_convert(user)}
 
