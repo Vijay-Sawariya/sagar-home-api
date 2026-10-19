@@ -8,8 +8,7 @@ from fastapi import Body, Depends, HTTPException, Query
 
 STATUSES = ('New', 'Contacted', 'Qualified', 'Nurture', 'Disqualified', 'Invalid')
 OUTCOMES = ('Connected', 'No answer', 'Busy', 'Wrong number', 'Message sent')
-DUE = """EXISTS (SELECT 1 FROM actions a WHERE a.entity_type='sheet_enquiry'
- AND a.entity_id=e.id AND a.status IN ('Pending','Missed')
+DUE = """e.id IN (SELECT a.entity_id FROM actions a WHERE a.entity_type='sheet_enquiry' AND a.status IN ('Pending','Missed')
  AND TIMESTAMP(a.due_date,COALESCE(a.due_time,'00:00:00'))<=NOW())"""
 
 
@@ -184,10 +183,15 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
         with get_db() as conn:
             c = conn.cursor(); ready(c)
             where, args = scope(user)
+            unfiltered = not (q.strip() or status or assigned or due or duplicates)
             c.execute(f"""SELECT COUNT(*) total,COALESCE(SUM(e.status='New'),0) new_count,
              COALESCE(SUM(e.assigned_to IS NULL),0) unassigned,COALESCE(SUM(e.assigned_to IS NOT NULL),0) assigned,
-             COALESCE(SUM({DUE}),0) due,COALESCE(SUM(e.status='Qualified'),0) qualified,
-             COALESCE(SUM(e.main_lead_id IS NOT NULL),0) converted FROM sheet_enquiries e WHERE {where}""", args)
+             COALESCE(SUM(overdue.entity_id IS NOT NULL),0) due,COALESCE(SUM(e.status='Qualified'),0) qualified,
+             COALESCE(SUM(e.main_lead_id IS NOT NULL),0) converted FROM sheet_enquiries e
+             LEFT JOIN (SELECT DISTINCT entity_id FROM actions
+              WHERE entity_type='sheet_enquiry' AND status IN ('Pending','Missed')
+               AND TIMESTAMP(due_date,COALESCE(due_time,'00:00:00'))<=NOW()) overdue
+              ON overdue.entity_id=e.id WHERE {where}""", args)
             stats = c.fetchone()
             if q.strip():
                 where += ' AND (e.full_name LIKE %s OR e.phone LIKE %s OR e.email LIKE %s OR e.property_interest LIKE %s)'
@@ -206,10 +210,22 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
             if duplicates:
                 where += ' AND ' + duplicate
             order = {'newest': 'e.id DESC', 'oldest': 'e.id ASC', 'name': 'e.full_name ASC,e.id DESC', 'status': 'e.status ASC,e.id DESC'}.get(sort, 'e.id DESC')
-            c.execute(f'SELECT COUNT(*) total FROM sheet_enquiries e WHERE {where}', args)
-            total = c.fetchone()['total']; pages = max(1, math.ceil(total / 27)); page = min(page, pages)
-            c.execute(f'SELECT e.*,u.full_name employee,{duplicate} possible_duplicate FROM sheet_enquiries e LEFT JOIN users u ON u.id=e.assigned_to WHERE {where} ORDER BY {order} LIMIT 27 OFFSET %s', args + [(page-1)*27])
-            items = [wire(r) for r in c.fetchall()]
+            if unfiltered:
+                total = stats['total']
+            else:
+                c.execute(f'SELECT COUNT(*) total FROM sheet_enquiries e WHERE {where}', args)
+                total = c.fetchone()['total']
+            pages = max(1, math.ceil(total / 27)); page = min(page, pages)
+            c.execute(f'SELECT e.id,e.full_name,e.phone,e.property_interest,e.status,e.assigned_to,e.main_lead_id,e.imported_at,e.spreadsheet_id,e.worksheet,e.original_json,u.full_name employee,{duplicate} possible_duplicate FROM sheet_enquiries e LEFT JOIN users u ON u.id=e.assigned_to WHERE {where} ORDER BY {order} LIMIT 27 OFFSET %s', args + [(page-1)*27])
+            items = []
+            for row in c.fetchall():
+                item = wire(row)
+                # Cards only need the Q&A; source snapshots/raw import rows belong in detail.
+                original = item.get('original') or {}
+                item['original'] = {k: original.get(k, []) for k in ('questions', 'answers')}
+                for key in ('current', 'qualification', 'source_changed'):
+                    item.pop(key, None)
+                items.append(item)
             return {'items': items, 'stats': stats, 'total': total, 'page': page, 'pages': pages,
                     'users': employees(c, user), 'can_assign': manager(user), 'can_convert': can_convert(user)}
 
