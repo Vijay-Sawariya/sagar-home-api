@@ -273,7 +273,7 @@ APP_FEATURE_FLAGS = {
     "followups": "Reminders",
     "daily_workbench": "Workbench",
     "legacy_inventory": "Legacy Inventory",
-    "enquiry_management": "Enquiry Management",
+    "enquiry_management": "Advertisement Enquiries",
     "assigned_leads": "Assigned Leads",
     "team_inbox": "Team Inbox",
     "agent_performance": "Performance",
