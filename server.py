@@ -1200,7 +1200,7 @@ def get_client_leads(
                LEFT JOIN users u ON l.created_by = u.id
                WHERE l.lead_type IN ('buyer', 'tenant') 
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-               ORDER BY COALESCE(l.updated_on, l.created_at) DESC, l.created_at DESC LIMIT %s OFFSET %s""",
+               ORDER BY l.created_at DESC, l.id DESC LIMIT %s OFFSET %s""",
             (limit, skip)
         )
         leads = cursor.fetchall()
@@ -1668,7 +1668,7 @@ def get_inventory_leads(
                LEFT JOIN users u ON l.created_by = u.id
                WHERE l.lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent')
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-               ORDER BY COALESCE(l.updated_on, l.created_at) DESC, l.created_at DESC LIMIT %s OFFSET %s""",
+               ORDER BY l.created_at DESC, l.id DESC LIMIT %s OFFSET %s""",
             (limit, skip)
         )
         leads = cursor.fetchall()
