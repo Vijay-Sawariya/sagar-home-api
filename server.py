@@ -2765,6 +2765,13 @@ def get_reminders(
             (current_user['id'], current_user['id'], limit, skip)
         )
         actions = cursor.fetchall()
+        enquiry_ids = list({int(a['entity_id']) for a in actions if a.get('entity_type') == 'sheet_enquiry' and a.get('entity_id')})
+        enquiry_map = {}
+        if enquiry_ids:
+            marks = ','.join(['%s'] * len(enquiry_ids))
+            cursor.execute(f'SELECT id,full_name,phone,assigned_to FROM sheet_enquiries WHERE id IN ({marks})', enquiry_ids)
+            enquiry_map = {int(e['id']): e for e in cursor.fetchall()}
+
         assignment_map = assignment_contact_map(
             cursor,
             [action.get('lead_id') for action in actions if action.get('lead_id')]
@@ -2774,6 +2781,14 @@ def get_reminders(
         result = []
         for a in actions:
             a_dict = dict(a)
+            if a_dict.get('entity_type') == 'sheet_enquiry':
+                enquiry = enquiry_map.get(int(a_dict.get('entity_id') or 0))
+                allowed = enquiry and (str(current_user.get('role', '')).strip().lower() in ('admin', 'manager') or int(enquiry.get('assigned_to') or 0) == int(current_user['id']))
+                a_dict['enquiry_contact_allowed'] = bool(allowed)
+                a_dict['lead_name'] = enquiry.get('full_name') if allowed else None
+                a_dict['lead_phone'] = enquiry.get('phone') if allowed else None
+                if allowed and a_dict.get('title') == f"Enquiry #{enquiry['id']} follow-up":
+                    a_dict['title'] = f"Enquiry {enquiry['full_name']} #{enquiry['id']} follow-up"
             # Map actions columns to reminder format for frontend
             # Combine due_date and due_time into reminder_date
             if a_dict.get('due_date'):
@@ -2793,6 +2808,9 @@ def get_reminders(
     user_role = current_user.get('role', '')
     user_id = current_user.get('id')
     for item in result:
+        if item.get('entity_type') == 'sheet_enquiry':
+            item['can_view_sensitive'] = item.get('enquiry_contact_allowed', False)
+            continue
         lead_created_by = item.get('lead_created_by')
         item['lead_current_assignee_id'] = (
             assignment_map.get(int(item['lead_id'])) if item.get('lead_id') else None

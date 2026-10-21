@@ -177,11 +177,39 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
         cursor.execute(f"SELECT id FROM leads WHERE COALESCE(is_deleted,0)<>1 AND LOWER(TRIM(lead_type)) IN ('buyer','tenant') AND {phone_expr()} IN (%s,%s,%s,%s)", (key, '91'+key, '0091'+key, '0'+key))
         return list(cursor.fetchall())
 
+    def assign_repeats(c, conn, user):
+        if not manager(user):
+            return
+        allowed = {int(u['id']) for u in employees(c, user)}
+        c.execute("SELECT id,phone FROM sheet_enquiries WHERE assigned_to IS NULL AND main_lead_id IS NULL AND status<>'Invalid' ORDER BY id")
+        candidates = list(c.fetchall())
+        for candidate in candidates:
+            key = phone_key(candidate.get('phone'))
+            if len(key) != 10:
+                continue
+            variants = (key, '91'+key, '0091'+key, '0'+key)
+            conn.begin()
+            try:
+                row = get_row(c, candidate['id'], user, True)
+                if not row.get('assigned_to') and not row.get('main_lead_id') and row.get('status') != 'Invalid':
+                    c.execute(f"SELECT (SELECT la.user_id FROM lead_assignments la WHERE la.lead_id=leads.id ORDER BY la.assigned_at DESC,la.user_id DESC LIMIT 1) assigned_to FROM leads WHERE COALESCE(is_deleted,0)<>1 AND LOWER(TRIM(lead_type)) IN ('buyer','tenant') AND {phone_expr()} IN (%s,%s,%s,%s) UNION ALL SELECT assigned_to FROM sheet_enquiries WHERE id<>%s AND status<>'Invalid' AND {phone_expr()} IN (%s,%s,%s,%s)", (*variants, row['id'], *variants))
+                    owners = {int(r['assigned_to']) for r in c.fetchall() if r.get('assigned_to')}
+                    if len(owners) == 1 and next(iter(owners)) in allowed:
+                        owner = next(iter(owners))
+                        c.execute('UPDATE sheet_enquiries SET assigned_to=%s,updated_at=NOW() WHERE id=%s', (owner, row['id']))
+                        c.execute("UPDATE actions SET user_id=%s,assigned_to=%s WHERE entity_type='sheet_enquiry' AND entity_id=%s AND status IN ('Pending','Missed')", (owner, owner, row['id']))
+                        audit(c, row['id'], user, 'assignment', {'from': None, 'to': owner, 'reason': 'repeat_phone_match'})
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     @router.get('/mobile/enquiry-management')
     def listing(q: str = Query('', max_length=255), status: str = '', assigned: str = '', due: bool = False,
                 duplicates: bool = False, sort: str = 'newest', page: int = Query(1, ge=1), user: dict = Depends(authorized_user)):
         with get_db() as conn:
             c = conn.cursor(); ready(c)
+            assign_repeats(c, conn, user)
             where, args = scope(user)
             unfiltered = not (q.strip() or status or assigned or due or duplicates)
             c.execute(f"""SELECT COUNT(*) total,COALESCE(SUM(e.status='New'),0) new_count,
@@ -242,6 +270,12 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                     item['followup_count'] += 1
                     if item['next_followup'] is None:
                         item['next_followup'] = wire(followup)
+            if by_id:
+                c.execute(f"SELECT enquiry_id,details,created_at FROM sheet_enquiry_activities WHERE enquiry_id IN ({marks}) AND event_type='conversation' ORDER BY id DESC", list(by_id))
+                for event in c.fetchall():
+                    item = by_id[int(event['enquiry_id'])]
+                    if 'last_conversation' not in item:
+                        item['last_conversation'] = dict(unpack(event['details']), created_at=str(event['created_at']))
             return {'items': items, 'stats': stats, 'total': total, 'page': page, 'pages': pages,
                     'users': employees(c, user), 'can_assign': manager(user), 'can_convert': can_convert(user)}
 
@@ -281,9 +315,9 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                 key = phone_key(q)
                 if len(key) >= 2:
                     search += f' OR {phone_expr()} LIKE %s'; args.append('%'+key+'%')
-            c.execute(f"SELECT * FROM leads WHERE COALESCE(is_deleted,0)<>1 AND LOWER(TRIM(lead_type)) IN ('buyer','tenant') AND ({search}) ORDER BY name,id LIMIT 100", args)
+            c.execute(f"SELECT leads.*,(SELECT la.user_id FROM lead_assignments la WHERE la.lead_id=leads.id ORDER BY la.assigned_at DESC,la.user_id DESC LIMIT 1) current_owner FROM leads WHERE COALESCE(is_deleted,0)<>1 AND LOWER(TRIM(lead_type)) IN ('buyer','tenant') AND ({search}) ORDER BY name,id LIMIT 100", args)
             rows = list(c.fetchall())
-            return [{k: r.get(k) for k in ('id', 'name', 'phone', 'lead_type', 'location')}
+            return [dict({k: r.get(k) for k in ('id', 'name', 'phone', 'lead_type', 'location')}, assigned_to=r.get('current_owner') or r.get('assigned_to'))
                     for r in rows if lead_permission(c, r, user)][:20]
 
     @router.post('/mobile/enquiry-management/{enquiry_id}/{action}')
@@ -320,18 +354,26 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                     c.execute('UPDATE sheet_enquiries SET status=%s,updated_at=NOW() WHERE id=%s', (status, enquiry_id))
                     audit(c, enquiry_id, user, 'status', {'from': row['status'], 'to': status})
                 elif action == 'followup':
-                    if not row.get('assigned_to'):
-                        raise HTTPException(422, 'Assign an employee before scheduling a follow-up.')
-                    due = future_due(payload.get('due_at')); outcome = payload.get('outcome')
+                    owner = row.get('assigned_to')
+                    due = future_due(payload.get('due_at')) if payload.get('due_at') else None
+                    outcome = payload.get('outcome')
                     if outcome not in OUTCOMES:
                         raise HTTPException(422, 'Choose a follow-up outcome.')
                     remarks = str(payload.get('remarks') or '').strip()
                     if len(remarks.encode()) > 2000:
                         raise HTTPException(422, 'Remarks must be 2000 bytes or fewer.')
-                    c.execute("""INSERT INTO actions (user_id,assigned_to,lead_id,entity_type,entity_id,title,description,action_type,priority,due_date,due_time,status)
-                     VALUES (%s,%s,NULL,'sheet_enquiry',%s,%s,%s,'Call','Medium',%s,%s,'Pending')""",
-                     (row['assigned_to'], row['assigned_to'], enquiry_id, f'Enquiry #{enquiry_id} follow-up', 'Outcome: '+outcome+'\n'+remarks, due.date(), due.strftime('%H:%M:%S')))
-                    audit(c, enquiry_id, user, 'followup', {'action_id': c.lastrowid, 'due_at': payload['due_at'], 'outcome': outcome, 'remarks': remarks})
+                    if not owner:
+                        owner = assignee(c, row, payload, user)
+                        c.execute('UPDATE sheet_enquiries SET assigned_to=%s,updated_at=NOW() WHERE id=%s', (owner, enquiry_id))
+                    action_id = None
+                    if due:
+                        c.execute("""INSERT INTO actions (user_id,assigned_to,lead_id,entity_type,entity_id,title,description,action_type,priority,due_date,due_time,status)
+                         VALUES (%s,%s,NULL,'sheet_enquiry',%s,%s,%s,'Call','Medium',%s,%s,'Pending')""",
+                         (owner, owner, enquiry_id, f"Enquiry {row.get('full_name') or ''} #{enquiry_id} follow-up", 'Outcome: '+outcome+'\n'+remarks, due.date(), due.strftime('%H:%M:%S')))
+                        action_id = c.lastrowid
+                    if outcome == 'Connected':
+                        c.execute('UPDATE sheet_enquiries SET contacted_at=COALESCE(contacted_at,NOW()),updated_at=NOW() WHERE id=%s', (enquiry_id,))
+                    audit(c, enquiry_id, user, 'followup' if due else 'conversation', {'action_id': action_id, 'due_at': payload.get('due_at') or None, 'outcome': outcome, 'remarks': remarks})
                 else:
                     owner = assignee(c, row, payload, user)
                     if action == 'link_existing':

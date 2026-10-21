@@ -223,6 +223,28 @@ def register_routes(router, get_db, get_current_user, lead_model):
             return {'items': rows, 'total': total, 'page': page, 'has_more': page*40 < total,
                     'months': [m['month'] for m in cursor.fetchall()]}
 
+    @router.post('/monthly-inventory/{entry_id}/status')
+    def update_status(entry_id: int, payload: dict = Body(...), user=Depends(authorized)):
+        status = payload.get('inventory_status')
+        if status not in ('Available', 'Sold', 'Hold', 'Invalid'):
+            raise HTTPException(422, 'Select a valid inventory status.')
+        with monthly_db() as conn:
+            c = conn.cursor()
+            c.execute("SHOW COLUMNS FROM monthly_inventory_entries LIKE 'inventory_status'")
+            if not c.fetchone():
+                raise HTTPException(503, 'Install the web monthly inventory status migration first.')
+            conn.begin()
+            try:
+                c.execute('SELECT id FROM monthly_inventory_entries WHERE id=%s AND is_deleted=0 FOR UPDATE', (entry_id,))
+                if not c.fetchone():
+                    raise HTTPException(404, 'Inventory entry not found.')
+                c.execute('UPDATE monthly_inventory_entries SET inventory_status=%s,status_changed_at=NOW(),status_changed_by=%s WHERE id=%s', (status, user['id'], entry_id))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return {'inventory_status': status}
+
     @router.post('/monthly-inventory/{entry_id}/delete')
     def delete_book(entry_id: int, user=Depends(authorized)):
         with monthly_db() as conn:
