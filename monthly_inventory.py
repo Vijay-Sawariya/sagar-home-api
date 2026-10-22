@@ -1,5 +1,6 @@
 """Read/convert the web application's monthly books; deliberately no upload routes."""
 import logging
+from typing import List, Optional
 from contextlib import contextmanager
 from urllib.parse import urlparse
 from pymysql.err import MySQLError
@@ -186,7 +187,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
         return user
 
     @router.get('/monthly-inventory')
-    def list_books(month: str = '', category: str = '', search: str = '', page: int = Query(1, ge=1), location: str = '', address: str = '', owner_name: str = '', phone: str = '', floor: str = '', min_area: float = Query(None, ge=0), max_area: float = Query(None, ge=0), user=Depends(authorized)):
+    def list_books(month: str = '', category: str = '', search: str = '', page: int = Query(1, ge=1), location: str = '', locations: Optional[List[str]] = Query(None), address: str = '', owner_name: str = '', phone: str = '', floor: str = '', min_area: float = Query(None, ge=0), max_area: float = Query(None, ge=0), user=Depends(authorized)):
         if month and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
             raise HTTPException(422, 'Select a valid month.')
         if category and category not in CATEGORIES:
@@ -203,6 +204,10 @@ def register_routes(router, get_db, get_current_user, lead_model):
             if search.strip():
                 where.append("CONCAT_WS(' ',e.owner_name,e.phone,e.address,e.location,e.note) LIKE %s")
                 args.append('%' + search.strip()[:200] + '%')
+            selected_locations = list(dict.fromkeys(value.strip() for value in (locations or []) if value.strip()))
+            if selected_locations:
+                where.append('e.location IN (' + ','.join(['%s'] * len(selected_locations)) + ')')
+                args.extend(selected_locations)
             for column, value in [('location', location), ('address', address), ('owner_name', owner_name), ('phone', phone), ('floor', floor)]:
                 if value.strip():
                     where.append(f'e.{column} LIKE %s')
@@ -229,9 +234,11 @@ def register_routes(router, get_db, get_current_user, lead_model):
                 key = (address_key(row['address']), address_key(row['location']))
                 row['matching_lead_id'] = matches.get(key) if all(key) else None
                 row['pdf_id'] = pdfs.get((str(row['book_month']), row['category']))
+            cursor.execute("SELECT DISTINCT location FROM monthly_inventory_entries WHERE is_deleted=0 AND location IS NOT NULL AND TRIM(location)<>'' ORDER BY location")
+            locations_available = [row['location'] for row in cursor.fetchall()]
             cursor.execute("SELECT DISTINCT DATE_FORMAT(book_month,'%Y-%m') AS month FROM monthly_inventory_books ORDER BY month DESC")
             return {'items': rows, 'total': total, 'page': page, 'has_more': page*40 < total,
-                    'months': [m['month'] for m in cursor.fetchall()]}
+                    'months': [m['month'] for m in cursor.fetchall()], 'locations': locations_available}
 
     @router.post('/monthly-inventory/{entry_id}/status')
     def update_status(entry_id: int, payload: dict = Body(...), user=Depends(authorized)):
