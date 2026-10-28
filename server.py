@@ -246,6 +246,25 @@ def get_db():
     finally:
         connection.close()
 
+
+# Read-only, non-secret shared LMS dropdown catalogue. No runtime DDL or seeds.
+@api_router.get("/dropdown-options")
+def get_dropdown_options(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    categories = ("locations", "floors", "bhk", "facings", "lead_sources", "amenities")
+    options = {category: [] for category in categories}
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id,category,value,label,sort_order,is_active,version FROM global_dropdown_options WHERE is_active=1 ORDER BY category,sort_order,id")
+                for row in cursor.fetchall():
+                    if row["category"] in options:
+                        options[row["category"]].append(row)
+    except pymysql.MySQLError:
+        logging.exception("Shared dropdown catalogue unavailable")
+        raise HTTPException(status_code=503, detail="Shared dropdowns are unavailable. Install the LMS global dropdown migration.")
+    return {"schema_version": 1, "options": options}
+
 # ============= Helper Functions =============
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
