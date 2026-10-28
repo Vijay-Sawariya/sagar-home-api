@@ -1653,6 +1653,8 @@ def add_preferred_leads(
 
     return {"success": True, "added": inserted, "selected": len(ids)}
 
+from inventory_sort import address_order_sql
+
 @api_router.get("/leads/inventory")
 def get_inventory_leads(
     skip: int = 0,
@@ -1663,12 +1665,12 @@ def get_inventory_leads(
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT l.*, u.full_name as created_by_name 
+            f"""SELECT l.*, u.full_name as created_by_name
                FROM leads l
                LEFT JOIN users u ON l.created_by = u.id
                WHERE l.lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent')
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-               ORDER BY l.created_at DESC, l.id DESC LIMIT %s OFFSET %s""",
+               ORDER BY {address_order_sql('l.address')}, l.id ASC LIMIT %s OFFSET %s""",
             (limit, skip)
         )
         leads = cursor.fetchall()
