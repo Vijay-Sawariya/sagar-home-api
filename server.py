@@ -1689,7 +1689,7 @@ def get_inventory_leads(
                LEFT JOIN users u ON l.created_by = u.id
                WHERE l.lead_type IN ('seller', 'owner', 'landlord', 'builder', 'agent')
                AND (l.is_deleted IS NULL OR l.is_deleted = 0)
-               ORDER BY {address_order_sql('l.address')}, l.id ASC LIMIT %s OFFSET %s""",
+               ORDER BY l.created_at DESC, l.id DESC LIMIT %s OFFSET %s""",
             (limit, skip)
         )
         leads = cursor.fetchall()
