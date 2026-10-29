@@ -20,6 +20,7 @@ import json
 import csv
 import io
 import inventory_updates
+import inventory_recipient_matching
 import schema_setup
 
 # Import for AI features
@@ -1532,6 +1533,8 @@ def get_matching_clients(
     area_max: Optional[float] = None,
     budget_min: Optional[float] = None,
     budget_max: Optional[float] = None,
+    filters_submitted: bool = False,
+    match_context: str = '',
     current_user: dict = Depends(get_current_user)
 ):
     """Find buyer/tenant client candidates for a seller/builder/owner inventory lead."""
@@ -1542,34 +1545,27 @@ def get_matching_clients(
         if not inventory:
             raise HTTPException(status_code=404, detail="Lead not found")
 
-        defaults = _matching_defaults(inventory)
         inventory_pricing = _get_floor_pricing_map(cursor, [lead_id]).get(lead_id, [])
-        inv_min, inv_max = _lead_price_range(inventory, inventory_pricing, defaults["floors"])
-        if defaults["budget_min"] is None and inv_min is not None:
-            defaults["budget_min"] = inv_min * 0.8
-        if defaults["budget_max"] is None and inv_max is not None:
-            defaults["budget_max"] = inv_max * 1.2
-
-        selected_locations = _parse_multi_param(locations) or defaults["locations"]
-        selected_floors = _parse_multi_param(floors) or defaults["floors"]
-        effective_area_min = area_min if area_min is not None else defaults["area_min"]
-        effective_area_max = area_max if area_max is not None else defaults["area_max"]
-        effective_budget_min = budget_min if budget_min is not None else defaults["budget_min"]
-        effective_budget_max = budget_max if budget_max is not None else defaults["budget_max"]
-
-        inventory_type = str(inventory.get('lead_type') or '').lower()
-        target_types = ['buyer', 'tenant']
-        if inventory_type in ['seller', 'builder', 'agent']:
-            target_types = ['buyer']
-        elif inventory_type in ['landlord', 'owner']:
-            target_types = ['tenant']
+        defaults = inventory_recipient_matching.defaults(inventory, inventory_pricing)
+        selected_locations = _parse_multi_param(locations) if locations is not None or filters_submitted else defaults['locations']
+        selected_floors = _parse_multi_param(floors) if floors is not None or filters_submitted else defaults['floors']
+        effective_area_min = area_min if area_min is not None or filters_submitted else defaults['area_min']
+        effective_area_max = area_max if area_max is not None or filters_submitted else defaults['area_max']
+        effective_budget_min = budget_min if budget_min is not None or filters_submitted else defaults['budget_min']
+        effective_budget_max = budget_max if budget_max is not None or filters_submitted else defaults['budget_max']
+        matching_filters = {'locations': selected_locations, 'floors': selected_floors,
+            'area_min': effective_area_min, 'area_max': effective_area_max,
+            'budget_min': effective_budget_min, 'budget_max': effective_budget_max}
+        target_types = inventory_recipient_matching.target_types(inventory, match_context)
+        if not target_types:
+            raise HTTPException(status_code=400, detail='This inventory type does not support matching clients.')
         placeholders = ','.join(['%s'] * len(target_types))
         cursor.execute(f"""
             SELECT l.*, u.full_name AS created_by_name
             FROM leads l
             LEFT JOIN users u ON u.id = l.created_by
             WHERE l.id != %s
-              AND LOWER(IFNULL(l.lead_type, '')) IN ({placeholders})
+              AND LOWER(TRIM(IFNULL(l.lead_type, ''))) IN ({placeholders})
               AND (l.is_deleted IS NULL OR l.is_deleted = 0)
             ORDER BY l.created_at DESC
         """, [lead_id, *target_types])
@@ -1585,33 +1581,12 @@ def get_matching_clients(
 
     matches = []
     for row in candidates:
-        if not _location_matches(row.get('location'), selected_locations):
+        match_reasons = inventory_recipient_matching.reasons(inventory, row, matching_filters)
+        if match_reasons is None:
             continue
-        if not _floor_matches(row.get('floor'), selected_floors):
-            continue
-
-        candidate_area = _float_or_none(row.get('area_size'))
-        if effective_area_min is not None and candidate_area is not None and candidate_area < effective_area_min:
-            continue
-        if effective_area_max is not None and candidate_area is not None and candidate_area > effective_area_max:
-            continue
-
-        buyer_min, buyer_max = _lead_price_range(row)
-        expanded_min = buyer_min * 0.8 if buyer_min is not None else None
-        expanded_max = buyer_max * 1.2 if buyer_max is not None else None
-        if not _ranges_overlap(expanded_min, expanded_max, effective_budget_min, effective_budget_max):
-            continue
-
         item = dict(row)
         item['is_preferred'] = row['id'] in preferred_client_ids
-        item['match_reasons'] = [
-            reason for reason, ok in [
-                ('Location', bool(selected_locations)),
-                ('Floor', bool(selected_floors)),
-                ('Area +/- 100 sq yds', effective_area_min is not None or effective_area_max is not None),
-                ('Budget +/- 20%', effective_budget_min is not None or effective_budget_max is not None),
-            ] if ok
-        ]
+        item['match_reasons'] = match_reasons or ['Filtered match']
         # Apply masking based on user permissions
         user_role = current_user.get('role', '')
         user_id = current_user.get('id')
