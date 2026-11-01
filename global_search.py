@@ -1,4 +1,6 @@
 """Global search over mobile screen readers, after their scope and privacy rules."""
+from contextlib import contextmanager
+from time import monotonic
 import logging
 import re
 from global_search_queries import rows as search_rows
@@ -65,23 +67,39 @@ def register_routes(router, env):
             return {'sources': [{'key': key, 'label': label}
                     for key, (label, flag, _, _) in sources.items()
                     if not flag or flags.get(flag, False)]}
-        groups, errors = {}, []
-        for key, (label, flag, reader, path) in sources.items():
-            if source and source != key or flag and not flags.get(flag, False):
-                continue
-            try:
-                total, items = 0, []
-                for row in search_rows(env, key, current_user, term, exact, FIELDS):
-                    if row.get('can_view_sensitive') is False:
-                        row = {k: v for k, v in row.items() if k in ('id','name','lead_status','location','address','phone','property_type','floor','bhk','area_size','budget','price')}
-                    if not matches(row, term, exact):
-                        continue
-                    total += 1
-                    if (page - 1)*20 < total <= page*20:
-                        items.append({'row': {k: row[k] for k in FIELDS if k in row},
-                                      'url': path + str(row['id']) if path.endswith('/') else (path + '?entry_id=' + str(row['id']) if key == 'monthly' else path)})
-                groups[key] = {'label': label, 'total': total, 'items': items}
-            except Exception:
-                logging.exception('Global search source %s failed', key)
-                errors.append(label)
-        return {'groups': groups, 'errors': errors}
+        groups, errors, timings = {}, [], {}
+        # A search is one unit of work. Reuse its connection and schema metadata;
+        # opening a remote MySQL connection for every source adds network latency.
+        with env['get_db']() as connection:
+            @contextmanager
+            def search_db():
+                yield connection
+            columns_cache = {}
+            def search_columns(cursor, table):
+                if table not in columns_cache:
+                    columns_cache[table] = env['_table_columns'](cursor, table)
+                return columns_cache[table]
+            search_env = {**env, 'get_db': search_db, '_table_columns': search_columns}
+            for key, (label, flag, reader, path) in sources.items():
+                if source and source != key or flag and not flags.get(flag, False):
+                    continue
+                started = monotonic()
+                try:
+                    total, items = 0, []
+                    for row in search_rows(search_env, key, current_user, term, exact, FIELDS):
+                        if row.get('can_view_sensitive') is False:
+                            row = {k: v for k, v in row.items() if k in ('id','name','lead_status','location','address','phone','property_type','floor','bhk','area_size','budget','price')}
+                        if not matches(row, term, exact):
+                            continue
+                        total += 1
+                        if (page - 1)*20 < total <= page*20:
+                            items.append({'row': {k: row[k] for k in FIELDS if k in row},
+                                          'url': path + str(row['id']) if path.endswith('/') else (path + '?entry_id=' + str(row['id']) if key == 'monthly' else path)})
+                    groups[key] = {'label': label, 'total': total, 'items': items}
+                except Exception:
+                    logging.exception('Global search source %s failed', key)
+                    errors.append(label)
+                finally:
+                    timings[key] = round((monotonic() - started) * 1000)
+                    logging.info('Global search source=%s elapsed_ms=%s', key, timings[key])
+        return {'groups': groups, 'errors': errors, 'timings_ms': timings}
