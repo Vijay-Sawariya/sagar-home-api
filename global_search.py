@@ -81,7 +81,7 @@ def register_routes(router, env):
 
     @router.get('/global-search')
     def search(q: str = Query('', max_length=200), exact: bool = False,
-               page: int = Query(1, ge=1), source: str = '',
+               page: int = Query(1, ge=1), source: str = '', sources_only: bool = False,
                current_user: dict = Depends(env['get_current_user'])):
         if not current_user.get('id') or current_user.get('username') != 'vsawariya':
             raise HTTPException(403, 'Global search is available only to vsawariya.')
@@ -107,6 +107,10 @@ def register_routes(router, env):
             sources['ocr'] = ('Inventory OCR', 'inventory_ocr', lambda: extra_rows('ocr', current_user), '')
         if source and source not in sources:
             raise HTTPException(422, 'Unknown search source.')
+        if sources_only:
+            return {'sources': [{'key': key, 'label': label}
+                    for key, (label, flag, _, _) in sources.items()
+                    if not flag or flags.get(flag, False)]}
         groups, errors = {}, []
         for key, (label, flag, reader, path) in sources.items():
             if source and source != key or flag and not flags.get(flag, False):
