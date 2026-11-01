@@ -189,7 +189,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
         return user
 
     @router.get('/monthly-inventory')
-    def list_books(month: str = '', category: str = '', search: str = '', page: int = Query(1, ge=1), location: str = '', locations: Optional[List[str]] = Query(None), address: str = '', owner_name: str = '', phone: str = '', floor: str = '', min_area: float = Query(None, ge=0), max_area: float = Query(None, ge=0), user=Depends(authorized)):
+    def list_books(entry_id: int = Query(0, ge=0), month: str = '', category: str = '', search: str = '', page: int = Query(1, ge=1), location: str = '', locations: Optional[List[str]] = Query(None), address: str = '', owner_name: str = '', phone: str = '', floor: str = '', min_area: float = Query(None, ge=0), max_area: float = Query(None, ge=0), user=Depends(authorized)):
         if month and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
             raise HTTPException(422, 'Select a valid month.')
         if category and category not in CATEGORIES:
@@ -199,6 +199,8 @@ def register_routes(router, get_db, get_current_user, lead_model):
         with monthly_db() as conn:
             cursor = conn.cursor()
             where, args = ['e.is_deleted=0'], []
+            if entry_id:
+                where.append('e.id=%s'); args.append(entry_id)
             if month:
                 where.append("DATE_FORMAT(b.book_month,'%%Y-%%m')=%s"); args.append(month)
             if category:

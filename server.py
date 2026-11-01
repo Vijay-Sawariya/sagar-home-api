@@ -287,6 +287,9 @@ def ensure_user_permission_columns(cursor):
         pass
 
 APP_FEATURE_FLAGS = {
+    "contacts": "My Contacts",
+    "inventory_ocr": "Inventory OCR",
+    "agent_inventory": "Agent Inventory",
     "buyer_leads": "Clients",
     "seller_inventory": "Inventory",
     "builders_agents": "Builders",
@@ -2413,7 +2416,7 @@ def get_builders(
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM builders ORDER BY builder_name ASC LIMIT %s OFFSET %s",
+            "SELECT * FROM builders ORDER BY builder_name ASC, id ASC LIMIT %s OFFSET %s",
             (limit, skip)
         )
         builders = cursor.fetchall()
@@ -5089,7 +5092,7 @@ def get_mobile_workbench(current_user: dict = Depends(get_current_user)):
     }
 
 @api_router.get("/mobile/assigned-leads")
-def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), limit: int = 100):
+def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), limit: int = 100, skip: int = 0):
     """Read assignments from either web or mobile schemas without requiring DDL access."""
     user_role = (current_user.get('role') or '').strip().lower()
     user_id = current_user.get('id')
@@ -5127,7 +5130,7 @@ def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), li
             filters.append(f"({' OR '.join(membership)})")
         if 'is_deleted' in lead_columns:
             filters.append('(l.is_deleted IS NULL OR l.is_deleted = 0)')
-        params.append(safe_limit)
+        params.extend([safe_limit, max(0, skip)])
         cursor.execute(f"""
             SELECT l.*, u.full_name as created_by_name,
                    {owner} as current_assignee_id,
@@ -5137,7 +5140,7 @@ def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), li
             LEFT JOIN users assignee ON assignee.id = {owner}
             WHERE {' AND '.join(filters)}
             ORDER BY l.created_at DESC, l.id DESC
-            LIMIT %s
+            LIMIT %s OFFSET %s
         """, params)
         rows = cursor.fetchall()
         attach_current_assignees(cursor, rows)
@@ -5147,6 +5150,7 @@ def get_mobile_assigned_leads(current_user: dict = Depends(get_current_user), li
 def get_mobile_enquiries(
     current_user: dict = Depends(get_current_user),
     limit: int = 100,
+    skip: int = 0,
     category: Optional[str] = None,
     search: Optional[str] = None,
     name: Optional[str] = None,
@@ -5194,27 +5198,27 @@ def get_mobile_enquiries(
         rows = []
         if safe_category == "kothi":
             cursor.execute(
-                f"{_legacy_kothi_select()} WHERE {kothi_where}{kothi_search_clause} ORDER BY k.id DESC LIMIT %s",
-                tuple(kothi_search_params + [safe_limit])
+                f"{_legacy_kothi_select()} WHERE {kothi_where}{kothi_search_clause} ORDER BY k.id DESC LIMIT %s OFFSET %s",
+                tuple(kothi_search_params + [safe_limit, max(0, skip)])
             )
             rows = cursor.fetchall()
         elif safe_category == "floor":
             cursor.execute(
-                f"{_legacy_floor_select()} WHERE {floor_where}{floor_search_clause} ORDER BY e.created_at DESC LIMIT %s",
-                tuple(floor_search_params + [safe_limit])
+                f"{_legacy_floor_select()} WHERE {floor_where}{floor_search_clause} ORDER BY e.created_at DESC,e.id DESC LIMIT %s OFFSET %s",
+                tuple(floor_search_params + [safe_limit, max(0, skip)])
             )
             rows = cursor.fetchall()
         else:
             kothi_limit = max(1, safe_limit // 2)
             floor_limit = safe_limit - kothi_limit
             cursor.execute(
-                f"{_legacy_kothi_select()} WHERE {kothi_where}{kothi_search_clause} ORDER BY k.id DESC LIMIT %s",
-                tuple(kothi_search_params + [kothi_limit])
+                f"{_legacy_kothi_select()} WHERE {kothi_where}{kothi_search_clause} ORDER BY k.id DESC LIMIT %s OFFSET %s",
+                tuple(kothi_search_params + [kothi_limit, max(0, skip)])
             )
             rows.extend(cursor.fetchall())
             cursor.execute(
-                f"{_legacy_floor_select()} WHERE {floor_where}{floor_search_clause} ORDER BY e.created_at DESC LIMIT %s",
-                tuple(floor_search_params + [floor_limit])
+                f"{_legacy_floor_select()} WHERE {floor_where}{floor_search_clause} ORDER BY e.created_at DESC,e.id DESC LIMIT %s OFFSET %s",
+                tuple(floor_search_params + [floor_limit, max(0, skip)])
             )
             rows.extend(cursor.fetchall())
             rows.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
@@ -6324,6 +6328,9 @@ register_monthly_inventory_routes(api_router, get_db, get_current_user, LeadCrea
 from enquiry_management import register_routes as register_enquiry_management_routes
 register_enquiry_management_routes(api_router, get_db, get_current_user, _table_columns,
                                    _table_exists, active_assignment_user_condition)
+
+from global_search import register_routes as register_global_search_routes
+register_global_search_routes(api_router, globals())
 
 app.include_router(api_router)
 
