@@ -8,7 +8,7 @@ import math
 import re
 import tempfile
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from inventory_sort import address_order_sql
 
 from fastapi import Body, Depends, HTTPException, Query
@@ -25,6 +25,46 @@ def require_access(user):
 def address_key(value):
     return ''.join(c for c in str(value or '').strip().lower()
                    if not c.isspace() and unicodedata.category(c) not in ('Zs', 'Zl', 'Zp', 'Pd') and c not in ',.')
+
+
+def book_presence(cursor, leads, transaction):
+    identities = {}
+    for lead in leads:
+        if not lead.get('can_view_sensitive'):
+            continue
+        identity = (address_key(lead.get('address')), address_key(lead.get('location')))
+        if all(identity):
+            identities.setdefault(identity, []).append(lead['id'])
+    if not identities:
+        return {}
+
+    categories = [category for category in CATEGORIES if not transaction or category.endswith('_' + transaction)]
+    placeholders = ','.join(['%s'] * len(categories))
+    month = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().replace(day=1)
+    cursor.execute(f"""
+        SELECT e.id, e.address, e.location, b.book_month
+        FROM monthly_inventory_entries e JOIN monthly_inventory_books b ON b.id=e.book_id
+        WHERE e.is_deleted=0 AND b.category IN ({placeholders})
+          AND b.book_month=(SELECT MAX(book_month) FROM monthly_inventory_books
+                            WHERE book_month<=%s AND category IN ({placeholders}))
+        ORDER BY e.id
+    """, [*categories, month, *categories])
+    matches = {}
+    for entry in cursor.fetchall():
+        identity = (address_key(entry['address']), address_key(entry['location']))
+        for lead_id in identities.pop(identity, []):
+            matches[lead_id] = {'entry_id': entry['id'], 'month': entry['book_month'].strftime('%b %Y')}
+    if matches:
+        entry_ids = sorted({match['entry_id'] for match in matches.values()})
+        placeholders = ','.join(['%s'] * len(entry_ids))
+        cursor.execute(f"SELECT id,note FROM monthly_inventory_entries WHERE is_deleted=0 AND id IN ({placeholders})", entry_ids)
+        notes = {entry['id']: entry['note'] for entry in cursor.fetchall()}
+        for lead_id, match in list(matches.items()):
+            if match['entry_id'] in notes:
+                match['note'] = notes[match['entry_id']]
+            else:
+                del matches[lead_id]
+    return matches
 
 
 def phone_key(value):
@@ -190,7 +230,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
 
     @router.get('/monthly-inventory')
     def list_books(entry_id: int = Query(0, ge=0), month: str = '', category: str = '', search: str = '', page: int = Query(1, ge=1), location: str = '', locations: Optional[List[str]] = Query(None), address: str = '', owner_name: str = '', phone: str = '', floor: str = '', min_area: float = Query(None, ge=0), max_area: float = Query(None, ge=0), user=Depends(authorized)):
-        if month and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
+        if month and month != 'latest' and not re.fullmatch(r'\d{4}-(0[1-9]|1[0-2])', month):
             raise HTTPException(422, 'Select a valid month.')
         if category and category not in CATEGORIES:
             raise HTTPException(422, 'Select a valid category.')
@@ -201,7 +241,15 @@ def register_routes(router, get_db, get_current_user, lead_model):
             where, args = ['e.is_deleted=0'], []
             if entry_id:
                 where.append('e.id=%s'); args.append(entry_id)
-            if month:
+            if month == 'latest':
+                # Resolve the latest book inside the filtered query, before the
+                # count, sorting and pagination; never fetch all entries first.
+                latest = 'SELECT MAX(lb.book_month) FROM monthly_inventory_books lb'
+                if category:
+                    latest += ' WHERE lb.category=%s'
+                    args.append(category)
+                where.append(f'b.book_month=({latest})')
+            elif month:
                 where.append("DATE_FORMAT(b.book_month,'%%Y-%%m')=%s"); args.append(month)
             if category:
                 where.append('b.category=%s'); args.append(category)

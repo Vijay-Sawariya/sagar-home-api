@@ -1962,14 +1962,28 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
     response['calculations'] = calculations
     
     # Fetch matched properties for client leads (buyer, tenant)
-    if lead.get('lead_type') in ['buyer', 'tenant']:
+    if lead.get('lead_type') in ['buyer', 'tenant', 'rent']:
         with get_db() as conn:
             cursor = conn.cursor()
-            # Get matched properties from preferred_leads
-            cursor.execute("""
-                SELECT 
-                    pl.id as match_id,
-                    pl.reaction,
+            # Shared history is optional on older installations.
+            cursor.execute("SHOW TABLES LIKE 'inventory_shares'")
+            has_shared_history = bool(cursor.fetchall())
+            shared_condition = """EXISTS (
+                SELECT 1 FROM inventory_shares s
+                WHERE (s.buyer_lead_id = %s AND s.inventory_lead_id = m.id)
+                   OR (s.inventory_lead_id = %s AND s.buyer_lead_id = m.id)
+            )""" if has_shared_history else "0"
+            # One row per property, including bidirectional preferences and shares.
+            cursor.execute(f"""
+                SELECT
+                    (SELECT MAX(pl.id) FROM preferred_leads pl
+                     WHERE (pl.lead_id = %s AND pl.matching_lead_id = m.id)
+                        OR (pl.matching_lead_id = %s AND pl.lead_id = m.id)) as match_id,
+                    (SELECT pl.reaction FROM preferred_leads pl
+                     WHERE (pl.lead_id = %s AND pl.matching_lead_id = m.id)
+                        OR (pl.matching_lead_id = %s AND pl.lead_id = m.id)
+                     ORDER BY pl.id DESC LIMIT 1) as reaction,
+                    ({shared_condition}) as is_shared,
                     m.id as property_id,
                     m.name as property_name,
                     m.lead_type as property_type,
@@ -1983,16 +1997,23 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
                     m.Property_locationUrl as property_map_url,
                     m.notes as property_notes,
                     m.unit as property_unit,
+                    m.budget_min as property_budget_min,
+                    m.budget_max as property_budget_max,
                     m.created_by as property_created_by,
                     m.assigned_to as property_assigned_to,
                     u.full_name as created_by_fullname,
                     u.phone as created_by_phone
-                FROM preferred_leads pl
-                LEFT JOIN leads m ON pl.matching_lead_id = m.id
+                FROM leads m
                 LEFT JOIN users u ON m.created_by = u.id
-                WHERE pl.lead_id = %s
-                ORDER BY pl.created_at DESC
-            """, (lead_id,))
+                WHERE COALESCE(m.is_deleted, 0) != 1
+                  AND LOWER(COALESCE(m.lead_status, '')) != 'sold'
+                  AND NOT (LOWER(COALESCE(m.lead_status, '')) REGEXP '(^|,)[[:space:]]*un-?available[[:space:]]*(,|$)')
+                  AND (EXISTS (SELECT 1 FROM preferred_leads pl
+                               WHERE (pl.lead_id = %s AND pl.matching_lead_id = m.id)
+                                  OR (pl.matching_lead_id = %s AND pl.lead_id = m.id))
+                       OR {shared_condition})
+                ORDER BY m.location, m.id
+            """, tuple([lead_id] * (10 if has_shared_history else 6)))
             matched_properties = cursor.fetchall()
             property_assignment_map = assignment_contact_map(
                 cursor,
@@ -6322,7 +6343,36 @@ def warm_edit_schema():
 
 
 # Include router
-from monthly_inventory import register_routes as register_monthly_inventory_routes
+from monthly_inventory import book_presence, require_access, register_routes as register_monthly_inventory_routes
+
+
+@api_router.post("/monthly-inventory/presence")
+def get_monthly_inventory_presence(payload: dict, current_user: dict = Depends(get_current_user)):
+    require_access(current_user)
+    ids = payload.get('lead_ids')
+    transaction = payload.get('transaction', '')
+    if not isinstance(ids, list) or len(ids) > 5000 or any(type(item) is not int or item <= 0 for item in ids):
+        raise HTTPException(422, 'Provide up to 5000 inventory lead IDs.')
+    if transaction not in ('', 'sale', 'rent'):
+        raise HTTPException(422, 'Choose sale or rent.')
+    if not ids:
+        return {}
+    ids = sorted(set(ids))
+    placeholders = ','.join(['%s'] * len(ids))
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT id,address,location,created_by,assigned_to
+            FROM leads
+            WHERE id IN ({placeholders}) AND COALESCE(is_deleted,0)=0
+              AND LOWER(lead_type) IN ('seller','builder','owner','landlord','agent')
+        """, ids)
+        leads = cursor.fetchall()
+        attach_current_assignees(cursor, leads)
+        leads = apply_lead_masking_batch(cursor, leads, current_user)
+        return book_presence(cursor, leads, transaction)
+
+
 register_monthly_inventory_routes(api_router, get_db, get_current_user, LeadCreate)
 
 from enquiry_management import register_routes as register_enquiry_management_routes
