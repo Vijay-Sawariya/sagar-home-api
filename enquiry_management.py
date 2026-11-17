@@ -1,5 +1,6 @@
 """Mobile workflow over the web LMS sheet_enquiries registry (not legacy inventory)."""
 import json
+import logging
 import math
 import re
 from datetime import datetime, timedelta
@@ -37,6 +38,37 @@ def phone_expr():
     for char in ("' '", "'+'", "'-'", "'('", "')'", "'.'", 'CHAR(9)', 'CHAR(10)', 'CHAR(13)'):
         expr = f'REPLACE({expr},{char},\'\')'
     return expr
+
+
+def attach_contact_badges(cursor, items):
+    """Batch read-only phone recognition shared by list and detail responses."""
+    numbers = {phone_key(item.get('phone')) for item in items} - {''}
+    for item in items:
+        item.update(contact_is_agent=False, contact_lead_ids=[])
+    if not numbers:
+        return
+    variants = sorted({variant for key in numbers for variant in (key, '91'+key, '0091'+key, '0'+key)})
+    marks = ','.join(['%s'] * len(variants))
+    leads, agents = {}, set()
+    for kind, sql in (
+        ('leads', f"SELECT id,phone FROM leads WHERE COALESCE(is_deleted,0)<>1 AND {phone_expr()} IN ({marks}) ORDER BY id"),
+        ('agents', f"SELECT phone FROM `ExternalAgents` WHERE {phone_expr()} IN ({marks})"),
+    ):
+        try:
+            cursor.execute(sql, variants)
+            for row in cursor.fetchall():
+                key = phone_key(row.get('phone'))
+                if key not in numbers:
+                    continue
+                if kind == 'leads':
+                    leads.setdefault(key, []).append(int(row['id']))
+                else:
+                    agents.add(key)
+        except Exception:
+            logging.getLogger(__name__).exception('Enquiry contact badge lookup failed for %s', kind)
+    for item in items:
+        key = phone_key(item.get('phone'))
+        item.update(contact_is_agent=key in agents, contact_lead_ids=leads.get(key, []))
 
 
 def unpack(value, default=None):
@@ -309,6 +341,7 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                     item = by_id[int(event['enquiry_id'])]
                     if 'last_conversation' not in item:
                         item['last_conversation'] = dict(unpack(event['details']), created_at=str(event['created_at']))
+            attach_contact_badges(c, items)
             return {'items': items, 'stats': stats, 'total': total, 'page': page, 'pages': pages,
                     'users': employees(c, user), 'can_assign': manager(user), 'can_convert': can_convert(user)}
 
@@ -332,7 +365,9 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
             where, args = scope(user)
             c.execute(f'SELECT e.id,e.property_interest FROM sheet_enquiries e WHERE {where} AND e.phone=%s AND e.id<>%s ORDER BY e.id DESC LIMIT 20', args + [row['phone'], enquiry_id])
             repeats = list(c.fetchall())
-            return {'item': wire(row), 'history': history, 'followups': followups, 'duplicates': repeats,
+            item = wire(row)
+            attach_contact_badges(c, [item])
+            return {'item': item, 'history': history, 'followups': followups, 'duplicates': repeats,
                     'matching_lead_count': len(matches(c, row['phone'])), 'users': employees(c, user),
                     'can_assign': manager(user), 'can_convert': can_convert(user)}
 
