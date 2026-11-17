@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from fastapi import Body, Depends, HTTPException, Query
 
-STATUSES = ('New', 'Contacted', 'Qualified', 'Nurture', 'Disqualified', 'Invalid')
+STATUSES = ('New', 'Contacted', 'Qualified', 'Nurture', 'Disqualified', 'Invalid', 'Agent enquiry')
 OUTCOMES = ('Connected', 'No answer', 'Busy', 'Wrong number', 'Message sent')
 DUE = """e.id IN (SELECT a.entity_id FROM actions a WHERE a.entity_type='sheet_enquiry' AND a.status IN ('Pending','Missed')
  AND TIMESTAMP(a.due_date,COALESCE(a.due_time,'00:00:00'))<=NOW())"""
@@ -21,7 +21,7 @@ def can_convert(user):
 
 
 def scope(user):
-    return ('1=1', []) if manager(user) else ('e.assigned_to=%s', [user['id']])
+    return ('e.is_deleted=0', []) if manager(user) else ('e.is_deleted=0 AND e.assigned_to=%s', [user['id']])
 
 
 def phone_key(value):
@@ -53,12 +53,24 @@ def wire(row):
         result['original'] = unpack(row.get('original_json'))
         result['current'] = unpack(row.get('current_json'))
         result['qualification'] = unpack(row.get('qualification_json'))
-        result['source'] = ('Website-Enquiry' if row.get('spreadsheet_id') == 'https://sagarhome.com'
+        result['source'] = ('Magicbricks' if row.get('spreadsheet_id') == 'magicbricks' and row.get('worksheet') == 'Magic Brick Enquiries' else 'Website-Enquiry' if row.get('spreadsheet_id') == 'https://sagarhome.com'
                             and row.get('worksheet') == 'Website-Enquiry' else 'Meta Ad')
+        original = result['original']
+        result['listing_url'] = listing_url(original)
         result['source_changed'] = row.get('original_json') != row.get('current_json')
         for key in ('original_json', 'current_json', 'qualification_json'):
             result.pop(key, None)
     return result
+
+
+def listing_url(original):
+    from urllib.parse import urlsplit
+    candidate = (original.get('parsed_lead') or {}).get('listing_URL') or (original.get('provider_fields') or {}).get('listing_URL') or original.get('listing_URL') or ''
+    try:
+        parts = urlsplit(candidate) if isinstance(candidate, str) else None
+        return candidate if parts and parts.scheme.lower() in ('http', 'https') and parts.netloc and parts.username is None and parts.password is None else ''
+    except ValueError:
+        return ''
 
 
 def get_row(cursor, enquiry_id, user, lock=False):
@@ -137,9 +149,26 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                     raise HTTPException(403, 'Enquiry Management access is disabled for your account.')
         return user
 
+    schema_checked = False
+
     def ready(cursor):
+        nonlocal schema_checked
         if not all(table_exists(cursor, t) for t in ('sheet_enquiries', 'sheet_enquiry_activities', 'sheet_enquiry_sync_runs')):
             raise HTTPException(503, 'Enquiry setup pending. Apply the web LMS 20261016_sheet_enquiries.sql migration.')
+        if not schema_checked:
+            cursor.execute("SELECT GET_LOCK('magicbricks_enquiry_schema',10) acquired")
+            if not cursor.fetchone()['acquired']:
+                raise HTTPException(503, 'Enquiry setup is busy. Retry shortly.')
+            try:
+                cursor.execute('SHOW COLUMNS FROM sheet_enquiries')
+                existing = {row['Field'] for row in cursor.fetchall()}
+                for field, definition in {'is_deleted':'TINYINT(1) NOT NULL DEFAULT 0', 'deleted_at':'DATETIME NULL', 'deleted_by':'INT NULL'}.items():
+                    if field not in existing:
+                        cursor.execute(f'ALTER TABLE sheet_enquiries ADD COLUMN {field} {definition}')
+                schema_checked = True
+            finally:
+                cursor.execute("SELECT RELEASE_LOCK('magicbricks_enquiry_schema')")
+
 
     def employees(cursor, user):
         condition = active_users(cursor)
@@ -181,7 +210,7 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
         if not manager(user):
             return
         allowed = {int(u['id']) for u in employees(c, user)}
-        c.execute("SELECT id,phone FROM sheet_enquiries WHERE assigned_to IS NULL AND main_lead_id IS NULL AND status<>'Invalid' ORDER BY id")
+        c.execute("SELECT id,phone FROM sheet_enquiries WHERE is_deleted=0 AND assigned_to IS NULL AND main_lead_id IS NULL AND status<>'Invalid' ORDER BY id")
         candidates = list(c.fetchall())
         for candidate in candidates:
             key = phone_key(candidate.get('phone'))
@@ -192,7 +221,7 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
             try:
                 row = get_row(c, candidate['id'], user, True)
                 if not row.get('assigned_to') and not row.get('main_lead_id') and row.get('status') != 'Invalid':
-                    c.execute(f"SELECT (SELECT la.user_id FROM lead_assignments la WHERE la.lead_id=leads.id ORDER BY la.assigned_at DESC,la.user_id DESC LIMIT 1) assigned_to FROM leads WHERE COALESCE(is_deleted,0)<>1 AND LOWER(TRIM(lead_type)) IN ('buyer','tenant') AND {phone_expr()} IN (%s,%s,%s,%s) UNION ALL SELECT assigned_to FROM sheet_enquiries WHERE id<>%s AND status<>'Invalid' AND {phone_expr()} IN (%s,%s,%s,%s)", (*variants, row['id'], *variants))
+                    c.execute(f"SELECT (SELECT la.user_id FROM lead_assignments la WHERE la.lead_id=leads.id ORDER BY la.assigned_at DESC,la.user_id DESC LIMIT 1) assigned_to FROM leads WHERE COALESCE(is_deleted,0)<>1 AND LOWER(TRIM(lead_type)) IN ('buyer','tenant') AND {phone_expr()} IN (%s,%s,%s,%s) UNION ALL SELECT assigned_to FROM sheet_enquiries WHERE is_deleted=0 AND id<>%s AND status<>'Invalid' AND {phone_expr()} IN (%s,%s,%s,%s)", (*variants, row['id'], *variants))
                     owners = {int(r['assigned_to']) for r in c.fetchall() if r.get('assigned_to')}
                     if len(owners) == 1 and next(iter(owners)) in allowed:
                         owner = next(iter(owners))
@@ -206,11 +235,15 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
 
     @router.get('/mobile/enquiry-management')
     def listing(q: str = Query('', max_length=255), status: str = '', assigned: str = '', due: bool = False,
-                duplicates: bool = False, sort: str = 'newest', page: int = Query(1, ge=1), user: dict = Depends(authorized_user)):
+                duplicates: bool = False, sort: str = 'newest', tab: str = 'general', page: int = Query(1, ge=1), user: dict = Depends(authorized_user)):
         with get_db() as conn:
             c = conn.cursor(); ready(c)
             assign_repeats(c, conn, user)
             where, args = scope(user)
+            if tab not in ('general', 'magicbricks'):
+                raise HTTPException(422, 'Choose a valid enquiry source.')
+            magic = "(e.spreadsheet_id='magicbricks' AND e.worksheet='Magic Brick Enquiries')"
+            where += ' AND ' + (magic if tab == 'magicbricks' else 'NOT ' + magic)
             unfiltered = not (q.strip() or status or assigned or due or duplicates)
             c.execute(f"""SELECT COUNT(*) total,COALESCE(SUM(e.status='New'),0) new_count,
              COALESCE(SUM(e.assigned_to IS NULL),0) unassigned,COALESCE(SUM(e.assigned_to IS NOT NULL),0) assigned,
@@ -234,7 +267,7 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                 where += ' AND e.assigned_to=%s'; args.append(int(assigned))
             if due:
                 where += ' AND ' + DUE
-            duplicate = 'EXISTS (SELECT 1 FROM sheet_enquiries d WHERE d.phone=e.phone AND d.id<>e.id)'
+            duplicate = 'EXISTS (SELECT 1 FROM sheet_enquiries d WHERE d.is_deleted=0 AND d.phone=e.phone AND d.id<>e.id)'
             if duplicates:
                 where += ' AND ' + duplicate
             order = {'newest': 'e.id DESC', 'oldest': 'e.id ASC', 'name': 'e.full_name ASC,e.id DESC', 'status': 'e.status ASC,e.id DESC'}.get(sort, 'e.id DESC')
@@ -322,7 +355,7 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
 
     @router.post('/mobile/enquiry-management/{enquiry_id}/{action}')
     def update(enquiry_id: int, action: str, payload: dict = Body(...), user: dict = Depends(authorized_user)):
-        if action not in ('assign', 'mark_invalid', 'restore_invalid', 'followup', 'qualify', 'link_existing'):
+        if action not in ('assign', 'mark_invalid', 'restore_invalid', 'mark_agent', 'restore_agent', 'soft_delete', 'followup', 'qualify', 'link_existing'):
             raise HTTPException(422, 'Unknown enquiry action.')
         if action == 'qualify' and not can_convert(user):
             raise HTTPException(403, 'Only administrators and senior agents may convert to Main Leads.')
@@ -343,14 +376,21 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                     # Retried conversion is idempotent, every other edit is rejected.
                     if action == 'qualify' or (action == 'link_existing' and str(payload.get('lead_id')) == str(row['main_lead_id'])):
                         conn.commit(); return {'lead_id': row['main_lead_id'], 'already_converted': True}
-                    raise HTTPException(409, 'Converted enquiries are read-only.')
+                    if action not in ('mark_invalid','restore_invalid','mark_agent','restore_agent','soft_delete'):
+                        raise HTTPException(409, 'Converted enquiries are read-only.')
                 if action == 'assign':
                     owner = assignee(c, row, payload, user)
                     c.execute('UPDATE sheet_enquiries SET assigned_to=%s,updated_at=NOW() WHERE id=%s', (owner, enquiry_id))
-                elif action in ('mark_invalid', 'restore_invalid'):
+                elif action == 'soft_delete':
+                    c.execute('UPDATE sheet_enquiries SET is_deleted=1,deleted_at=NOW(),deleted_by=%s,updated_at=NOW() WHERE id=%s', (user['id'], enquiry_id))
+                    c.execute("UPDATE actions SET status='Cancelled' WHERE entity_type='sheet_enquiry' AND entity_id=%s AND status IN ('Pending','Missed')", (enquiry_id,))
+                    audit(c, enquiry_id, user, 'soft_deleted', {'main_lead_id': row.get('main_lead_id'), 'previous_status': row['status']})
+                elif action in ('mark_invalid', 'restore_invalid', 'mark_agent', 'restore_agent'):
                     if action == 'restore_invalid' and row['status'] != 'Invalid':
                         raise HTTPException(409, 'Only invalid enquiries can be restored.')
-                    status = 'Invalid' if action == 'mark_invalid' else 'New'
+                    if action == 'restore_agent' and row['status'] != 'Agent enquiry':
+                        raise HTTPException(409, 'Only agent enquiries can be restored.')
+                    status = 'Invalid' if action == 'mark_invalid' else 'Agent enquiry' if action == 'mark_agent' else 'Qualified' if row.get('main_lead_id') else 'New'
                     c.execute('UPDATE sheet_enquiries SET status=%s,updated_at=NOW() WHERE id=%s', (status, enquiry_id))
                     audit(c, enquiry_id, user, 'status', {'from': row['status'], 'to': status})
                 elif action == 'followup':
@@ -400,6 +440,10 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                         data.update(email=row.get('email'), source_type='Inventory', created_by=user['id'], assigned_to=owner,
                                     lead_status=q['lead_status'] or 'Warm', created_at=datetime.now(ZoneInfo('Asia/Kolkata')).replace(tzinfo=None),
                                     meta_enquiry_text=f"{wire(row)['source']} enquiry #{enquiry_id}\nProperty: {row['property_interest']}\nEmail: {row.get('email', '')}\nQualification: {json.dumps(q, ensure_ascii=False)}\nOriginal questions and answers: {row['original_json']}")
+                        if wire(row)['source'] == 'Magicbricks':
+                            data['lead_source'] = 'Magicbricks'
+                            if listing_url(unpack(row.get('original_json'))):
+                                data['listing_URL'] = listing_url(unpack(row.get('original_json')))
                         available = columns(c, 'leads')
                         if 'meta_enquiry_text' not in available:
                             raise HTTPException(503, 'Apply the web LMS 20261017_meta_enquiry_text.sql migration before conversion.')
@@ -413,9 +457,12 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                         audit(c, enquiry_id, user, 'converted', {'lead_id': lead_id, 'linked_existing': False})
                     c.execute("UPDATE sheet_enquiries SET assigned_to=%s,status='Qualified',main_lead_id=%s,converted_at=NOW(),updated_at=NOW() WHERE id=%s", (owner, lead_id, enquiry_id))
                     conn.commit(); return {'lead_id': lead_id}
-                conn.commit(); return {'message': 'Enquiry updated.'}
+                conn.commit(); return {'message': 'Enquiry updated.', 'is_deleted': action == 'soft_delete', 'status': status if action in ('mark_invalid','restore_invalid','mark_agent','restore_agent') else row['status']}
             except Exception:
                 conn.rollback(); raise
             finally:
                 if locked:
                     c.execute("SELECT RELEASE_LOCK('sheet-enquiry-conversion')")
+
+    from enquiry_push import register_push_routes
+    register_push_routes(router, get_db, authorized_user, ready)
