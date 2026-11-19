@@ -292,6 +292,39 @@ def register_routes(router, get_db, get_current_user, lead_model):
             return {'items': rows, 'total': total, 'page': page, 'has_more': page*40 < total,
                     'months': [m['month'] for m in cursor.fetchall()], 'locations': locations_available}
 
+    @router.post('/monthly-inventory/{entry_id}/details')
+    def update_details(entry_id: int, payload: dict = Body(...), user=Depends(authorized)):
+        allowed = {'Property_locationUrl', 'building_facing'}
+        if not payload or set(payload) - allowed:
+            raise HTTPException(422, 'Choose location or inventory direction to update.')
+        directions = ('North', 'North East', 'East', 'South East', 'South', 'South West', 'West', 'North West')
+        data = {}
+        for key, value in payload.items():
+            if not isinstance(value, str):
+                raise HTTPException(422, 'Enter valid inventory details.')
+            value = value.strip()
+            if key == 'building_facing' and value not in directions:
+                raise HTTPException(422, 'Select a valid inventory direction.')
+            if key == 'Property_locationUrl':
+                url = urlparse(value)
+                if (len(value) > 2048 or url.scheme != 'https' or url.hostname != 'www.google.com'
+                        or url.path != '/maps' or not re.fullmatch(r'q=-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?', url.query)):
+                    raise HTTPException(422, 'Capture a valid Google Maps location.')
+            data[key] = value
+        with monthly_db() as conn:
+            conn.begin()
+            try:
+                cursor = conn.cursor()
+                cursor.execute('SELECT id FROM monthly_inventory_entries WHERE id=%s AND is_deleted=0 FOR UPDATE', (entry_id,))
+                if not cursor.fetchone():
+                    raise HTTPException(404, 'Inventory entry not found.')
+                cursor.execute('UPDATE monthly_inventory_entries SET ' + ','.join('`' + key + '`=%s' for key in data) + ' WHERE id=%s', [*data.values(), entry_id])
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return data
+
     @router.post('/monthly-inventory/{entry_id}/status')
     def update_status(entry_id: int, payload: dict = Body(...), user=Depends(authorized)):
         status = payload.get('inventory_status')
