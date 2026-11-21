@@ -20,6 +20,7 @@ import json
 import csv
 import io
 import inventory_updates
+from property_capture import hydrate_captures, sync_capture
 import inventory_recipient_matching
 import schema_setup
 
@@ -1671,6 +1672,7 @@ def get_inventory_leads(
             (limit, skip)
         )
         leads = cursor.fetchall()
+        hydrate_captures(cursor, leads)
         attach_current_assignees(cursor, leads)
         
         # Fetch floor pricing for all leads
@@ -1904,6 +1906,7 @@ def get_lead(lead_id: int, current_user: dict = Depends(get_current_user)):
         
         if not can_access_collaboration_lead(cursor, lead_id, current_user):
             raise HTTPException(403, 'Full lead access requires ownership, assignment or collaboration access.')
+
 
         # Fetch floor pricing from database
         cursor.execute(
@@ -2340,6 +2343,7 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         query = f"UPDATE leads SET {', '.join(update_fields)} WHERE id = %s"
         
         cursor.execute(query, values)
+        sync_capture(cursor, 'leads', lead_id, lead_data)
         conn.commit()
         
         # Keep the lead-level price range aligned with Web LMS floor pricing behavior.

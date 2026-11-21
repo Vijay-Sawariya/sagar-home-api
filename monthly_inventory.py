@@ -10,6 +10,7 @@ import tempfile
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from inventory_sort import address_order_sql
+from property_capture import hydrate_captures, sync_capture
 
 from fastapi import Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -275,6 +276,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
             total = cursor.fetchone()['total']
             cursor.execute(f"SELECT e.*,b.book_month,b.category,CASE WHEN {previous} IS NULL THEN 'First book' WHEN {repeated} THEN 'Repeated' ELSE 'New' END AS entry_status" + base + f" ORDER BY LOWER(TRIM(e.location)), {address_order_sql('e.address')}, b.book_month DESC,e.id LIMIT 40 OFFSET %s", args + [(page-1)*40])
             rows = list(cursor.fetchall())
+            hydrate_captures(cursor, rows)
             matches = {}
             if rows:
                 cursor.execute("SELECT id,address,location FROM leads WHERE COALESCE(is_deleted,0)=0 AND LOWER(lead_type) IN ('seller','builder','owner','landlord','agent') ORDER BY id DESC")
@@ -319,6 +321,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
                 if not cursor.fetchone():
                     raise HTTPException(404, 'Inventory entry not found.')
                 cursor.execute('UPDATE monthly_inventory_entries SET ' + ','.join('`' + key + '`=%s' for key in data) + ' WHERE id=%s', [*data.values(), entry_id])
+                sync_capture(cursor, 'monthly_inventory_entries', entry_id, data)
                 conn.commit()
             except Exception:
                 conn.rollback()
