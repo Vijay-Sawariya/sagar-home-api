@@ -21,6 +21,7 @@ import csv
 import io
 import inventory_updates
 from property_capture import hydrate_captures, sync_capture
+from construction_stage import validate_stage
 import inventory_recipient_matching
 import schema_setup
 
@@ -2301,6 +2302,11 @@ def get_inbox_summary(current_user: dict = Depends(get_current_user)):
 
 @api_router.put("/leads/{lead_id}")
 def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_current_user)):
+    if 'construction_stage' in lead_data:
+        try:
+            validate_stage(lead_data['construction_stage'])
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
     with get_db() as conn:
         cursor = conn.cursor()
         ensure_collaboration_tables(cursor)
@@ -2326,7 +2332,7 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
             'bhk', 'budget_min', 'budget_max', 'property_type',
             'lead_temperature', 'lead_status', 'lead_source', 'source_type', 'notes', 'floor', 'area_size',
             'car_parking_number', 'lift_available', 'unit', 'Property_locationUrl',
-            'building_facing', 'possession_on', 'property_age', 'builder_id',
+            'building_facing', 'construction_stage', 'possession_on', 'property_age', 'builder_id',
             'park_facing', 'park_at_rear', 'wide_road', 'peaceful_location', 'main_road', 'corner',
             'required_amenities'
         ]
@@ -2339,6 +2345,8 @@ def update_lead(lead_id: int, lead_data: dict, current_user: dict = Depends(get_
         if not update_fields:
             raise HTTPException(status_code=400, detail="No fields to update")
         
+        if set(lead_data) == {'construction_stage'}:
+            update_fields.append('updated_on = updated_on')
         values.append(lead_id)
         query = f"UPDATE leads SET {', '.join(update_fields)} WHERE id = %s"
         

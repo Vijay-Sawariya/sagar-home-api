@@ -5,7 +5,7 @@ Reads also reconcile old captures without requiring a destructive data migration
 """
 from pymysql.err import MySQLError
 
-FIELDS = ('Property_locationUrl', 'building_facing')
+FIELDS = ('Property_locationUrl', 'building_facing', 'construction_stage')
 
 
 def identity(row):
@@ -17,9 +17,9 @@ def identity(row):
 
 def capture_groups(cursor):
     try:
-        cursor.execute("SELECT id,address,location,Property_locationUrl,building_facing FROM leads WHERE COALESCE(is_deleted,0)=0 AND LOWER(TRIM(lead_type)) IN ('seller','builder','owner','landlord','rent','agent') ORDER BY id DESC")
+        cursor.execute("SELECT id,address,location,Property_locationUrl,building_facing,construction_stage FROM leads WHERE COALESCE(is_deleted,0)=0 AND LOWER(TRIM(lead_type)) IN ('seller','builder','owner','landlord','rent','agent') ORDER BY id DESC")
         leads = list(cursor.fetchall())
-        cursor.execute("SELECT e.id,e.address,e.location,e.Property_locationUrl,e.building_facing FROM monthly_inventory_entries e JOIN monthly_inventory_books b ON b.id=e.book_id WHERE e.is_deleted=0 ORDER BY b.book_month DESC,e.id DESC")
+        cursor.execute("SELECT e.id,e.address,e.location,e.Property_locationUrl,e.building_facing,e.construction_stage FROM monthly_inventory_entries e JOIN monthly_inventory_books b ON b.id=e.book_id WHERE e.is_deleted=0 ORDER BY b.book_month DESC,e.id DESC")
         entries = list(cursor.fetchall())
     except MySQLError as error:
         if error.args and error.args[0] in (1146, 1054):
@@ -34,7 +34,7 @@ def capture_groups(cursor):
                 group['records'].append((table, row['id']))
                 for field in FIELDS:
                     value = row.get(field)
-                    if isinstance(value, str) and value.strip():
+                    if isinstance(value, str) and (value.strip() or field == 'construction_stage'):
                         group['values'].setdefault(field, value.strip())
     return groups
 
@@ -53,6 +53,9 @@ def hydrate_captures(cursor, rows):
 
 def sync_capture(cursor, table, record_id, changes):
     changes = {field: changes[field] for field in FIELDS if field in changes}
+    if 'construction_stage' in changes:
+        from construction_stage import validate_stage
+        validate_stage(changes['construction_stage'])
     if not changes:
         return
     groups = capture_groups(cursor)
@@ -63,6 +66,7 @@ def sync_capture(cursor, table, record_id, changes):
             ids = sorted(row_id for name, row_id in group['records'] if name == target)
             if ids:
                 cursor.execute('UPDATE ' + target + ' SET ' + ','.join('`' + field + '`=%s' for field in changes)
+                               + (',updated_on=updated_on' if target == 'leads' else '')
                                + ' WHERE id IN (' + ','.join(['%s'] * len(ids)) + ')',
                                [*changes.values(), *ids])
         break

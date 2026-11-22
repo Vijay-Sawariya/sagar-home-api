@@ -11,6 +11,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from inventory_sort import address_order_sql
 from property_capture import hydrate_captures, sync_capture
+from construction_stage import validate_stage
 
 from fastapi import Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -171,7 +172,10 @@ def convert(conn, entry_id, payload, user, lead_model):
         if entry.get('converted_lead_id'):
             conn.commit()
             return {'id': entry['converted_lead_id'], 'already_converted': True}
+        hydrate_captures(cursor, [entry])
         data, prices = conversion_data(payload, entry, user, lead_model)
+        if entry.get('construction_stage') is not None:
+            data['construction_stage'] = validate_stage(entry['construction_stage'])
         if data.get('builder_id'):
             cursor.execute('SELECT id FROM builders WHERE id=%s AND COALESCE(is_deleted,0)=0', (data['builder_id'],))
             if not cursor.fetchone():
@@ -296,15 +300,20 @@ def register_routes(router, get_db, get_current_user, lead_model):
 
     @router.post('/monthly-inventory/{entry_id}/details')
     def update_details(entry_id: int, payload: dict = Body(...), user=Depends(authorized)):
-        allowed = {'Property_locationUrl', 'building_facing'}
+        allowed = {'Property_locationUrl', 'building_facing', 'construction_stage'}
         if not payload or set(payload) - allowed:
-            raise HTTPException(422, 'Choose location or inventory direction to update.')
+            raise HTTPException(422, 'Choose location, direction or construction stage to update.')
         directions = ('North', 'North East', 'East', 'South East', 'South', 'South West', 'West', 'North West')
         data = {}
         for key, value in payload.items():
             if not isinstance(value, str):
                 raise HTTPException(422, 'Enter valid inventory details.')
             value = value.strip()
+            if key == 'construction_stage':
+                try:
+                    validate_stage(value)
+                except ValueError as error:
+                    raise HTTPException(422, str(error))
             if key == 'building_facing' and value not in directions:
                 raise HTTPException(422, 'Select a valid inventory direction.')
             if key == 'Property_locationUrl':
