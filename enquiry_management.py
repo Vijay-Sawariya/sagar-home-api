@@ -1,4 +1,5 @@
 """Mobile workflow over the web LMS sheet_enquiries registry (not legacy inventory)."""
+from enquiry_provider import details as provider_details, latest_snapshot
 import json
 import logging
 import math
@@ -87,8 +88,8 @@ def wire(row):
         result['qualification'] = unpack(row.get('qualification_json'))
         result['source'] = ('Magicbricks' if row.get('spreadsheet_id') == 'magicbricks' and row.get('worksheet') == 'Magic Brick Enquiries' else 'Website-Enquiry' if row.get('spreadsheet_id') == 'https://sagarhome.com'
                             and row.get('worksheet') == 'Website-Enquiry' else 'Meta Ad')
-        original = result['original']
-        result['listing_url'] = listing_url(original)
+        result['provider_details'] = provider_details(latest_snapshot(row))
+        result['listing_url'] = result['provider_details']['listing_url']
         result['source_changed'] = row.get('original_json') != row.get('current_json')
         for key in ('original_json', 'current_json', 'qualification_json'):
             result.pop(key, None)
@@ -96,13 +97,7 @@ def wire(row):
 
 
 def listing_url(original):
-    from urllib.parse import urlsplit
-    candidate = (original.get('parsed_lead') or {}).get('listing_URL') or (original.get('provider_fields') or {}).get('listing_URL') or original.get('listing_URL') or ''
-    try:
-        parts = urlsplit(candidate) if isinstance(candidate, str) else None
-        return candidate if parts and parts.scheme.lower() in ('http', 'https') and parts.netloc and parts.username is None and parts.password is None else ''
-    except ValueError:
-        return ''
+    return provider_details(original)['listing_url']
 
 
 def get_row(cursor, enquiry_id, user, lock=False):
@@ -309,7 +304,7 @@ def register_routes(router, get_db, get_user, columns, table_exists, active_user
                 c.execute(f'SELECT COUNT(*) total FROM sheet_enquiries e WHERE {where}', args)
                 total = c.fetchone()['total']
             pages = max(1, math.ceil(total / 27)); page = min(page, pages)
-            c.execute(f'SELECT e.id,e.full_name,e.phone,e.property_interest,e.status,e.assigned_to,e.main_lead_id,e.imported_at,e.spreadsheet_id,e.worksheet,e.original_json,u.full_name employee,{duplicate} possible_duplicate FROM sheet_enquiries e LEFT JOIN users u ON u.id=e.assigned_to WHERE {where} ORDER BY {order} LIMIT 27 OFFSET %s', args + [(page-1)*27])
+            c.execute(f'SELECT e.id,e.full_name,e.phone,e.property_interest,e.status,e.assigned_to,e.main_lead_id,e.imported_at,e.spreadsheet_id,e.worksheet,e.original_json,e.current_json,u.full_name employee,{duplicate} possible_duplicate FROM sheet_enquiries e LEFT JOIN users u ON u.id=e.assigned_to WHERE {where} ORDER BY {order} LIMIT 27 OFFSET %s', args + [(page-1)*27])
             items = []
             for row in c.fetchall():
                 item = wire(row)
