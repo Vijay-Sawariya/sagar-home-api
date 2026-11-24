@@ -12,9 +12,14 @@ def details(payload):
     provider = payload.get('provider_fields') if isinstance(payload.get('provider_fields'), dict) else {}
     lead = payload.get('parsed_lead') if isinstance(payload.get('parsed_lead'), dict) else {}
     result = {key: text(provider.get(key)) for key in ('listing_id', 'response_id', 'location', 'configuration', 'budget')}
-    result['location'] = result['location'] or text(lead.get('location'))
-    result['configuration'] = result['configuration'] or text(lead.get('bhk'))
-    result['budget'] = result['budget'] or (' '.join((text(lead.get('budget_max')), text(lead.get('unit')))).strip())
+    # Older imports retain property facts as question/answer pairs.
+    questions = payload.get('questions', [])
+    answers = payload.get('answers', [])
+    qa = {text(q).lower().replace('_', ' ').strip(): text(a)
+          for q, a in zip(questions, answers)} if isinstance(questions, list) and isinstance(answers, list) else {}
+    result['location'] = result['location'] or text(lead.get('location')) or qa.get('location', '')
+    result['configuration'] = result['configuration'] or text(lead.get('bhk')) or qa.get('configuration', '')
+    result['budget'] = result['budget'] or (' '.join((text(lead.get('budget_max')), text(lead.get('unit')))).strip()) or qa.get('budget', '')
     result['message'] = next((text(value) for value in (provider.get('message'), provider.get('complete_message'), payload.get('message'), lead.get('meta_enquiry_text')) if text(value)), '')
     # An explicit empty provider URL means the link was removed.
     candidate = text(provider.get('listing_URL', lead.get('listing_URL', payload.get('listing_URL', ''))))
