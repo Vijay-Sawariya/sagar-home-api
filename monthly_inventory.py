@@ -303,7 +303,7 @@ def register_routes(router, get_db, get_current_user, lead_model):
         allowed = {'Property_locationUrl', 'building_facing', 'construction_stage'}
         if not payload or set(payload) - allowed:
             raise HTTPException(422, 'Choose location, direction or construction stage to update.')
-        directions = ('North', 'North East', 'East', 'South East', 'South', 'South West', 'West', 'North West')
+        directions = ('North', 'NorthEast', 'East', 'SouthEast', 'South', 'SouthWest', 'West', 'NorthWest')
         data = {}
         for key, value in payload.items():
             if not isinstance(value, str):
@@ -314,8 +314,11 @@ def register_routes(router, get_db, get_current_user, lead_model):
                     validate_stage(value)
                 except ValueError as error:
                     raise HTTPException(422, str(error))
-            if key == 'building_facing' and value not in directions:
-                raise HTTPException(422, 'Select a valid inventory direction.')
+            if key == 'building_facing':
+                direction_key = re.sub(r'[\s-]+', '', value).lower()
+                value = next((direction for direction in directions if direction.lower() == direction_key), value)
+                if value not in directions:
+                    raise HTTPException(422, 'Select a valid inventory direction.')
             if key == 'Property_locationUrl':
                 url = urlparse(value)
                 if (len(value) > 2048 or url.scheme != 'https' or url.hostname != 'www.google.com'

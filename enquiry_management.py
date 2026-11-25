@@ -88,6 +88,10 @@ def wire(row):
         result['qualification'] = unpack(row.get('qualification_json'))
         result['source'] = ('Magicbricks' if row.get('spreadsheet_id') == 'magicbricks' and row.get('worksheet') == 'Magic Brick Enquiries' else 'Website-Enquiry' if row.get('spreadsheet_id') == 'https://sagarhome.com'
                             and row.get('worksheet') == 'Website-Enquiry' else 'Meta Ad')
+        current = result['current']
+        parsed_lead = current.get('parsed_lead') if isinstance(current, dict) else None
+        lead_type = parsed_lead.get('lead_type') if isinstance(parsed_lead, dict) else None
+        result['lead_type'] = lead_type.strip() if isinstance(lead_type, str) else ''
         result['provider_details'] = provider_details(latest_snapshot(row))
         result['listing_url'] = result['provider_details']['listing_url']
         result['source_changed'] = row.get('original_json') != row.get('current_json')
